@@ -1,0 +1,20 @@
+build/bin
+node_modules
+frontend/dist
+*.db
+*.db-shm
+*.db-wal
+artifacts
+.env
+.idea/
+.vscode/
+vibe-resume/
+.dbg/
+.playwright-cli/
+output/
+tmp/
+debug-luna-image-400.md
+build/windows/installer/tmp/
+internal/domain/*.pptx
+internal/agent/New Text Document.txt
+internal/agent/kill-session-*.xml

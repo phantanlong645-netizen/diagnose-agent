@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "OLT Diagnostic Agent",
+  "outputfilename": "olt-diagnostic-agent",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "http://127.0.0.1:5173",
+  "author": {
+    "name": "wixie",
+    "email": "phantanlong645@gmail.com"
+  }
+}
