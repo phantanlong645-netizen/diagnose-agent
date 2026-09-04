@@ -519,6 +519,7 @@ func (j *Journal) SaveContext(conversationID, sourceRunID string, contextJSON []
 	return nil
 }
 
+// upsertConversationContext 以"插入或 revision+1 更新"的方式保存会话上下文快照。
 func upsertConversationContext(tx *sql.Tx, conversationID, sourceRunID string, contextJSON []byte, updatedAt time.Time) error {
 	if _, err := tx.Exec(`INSERT INTO conversation_contexts(conversation_id, format_version, revision, source_run_id, messages_json, updated_at)
         VALUES(?, 1, 1, ?, ?, ?)
@@ -533,6 +534,7 @@ func upsertConversationContext(tx *sql.Tx, conversationID, sourceRunID string, c
 	return nil
 }
 
+// Append 向 events 表追加一条诊断事件。
 func (j *Journal) Append(event domain.Event) error {
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {
@@ -545,6 +547,7 @@ func (j *Journal) Append(event domain.Event) error {
 	return nil
 }
 
+// Events 返回指定会话的全部事件，按写入顺序排列。
 func (j *Journal) Events(conversationID string) ([]domain.Event, error) {
 	rows, err := j.db.Query(`SELECT id, conversation_id, run_id, type, timestamp, payload_json
         FROM events WHERE conversation_id = ? ORDER BY sequence`, conversationID)

@@ -219,6 +219,7 @@ type ImageAttachment struct {
 	Data     string `json:"data"`     // base64 编码（不含 data: 前缀）
 }
 
+// ConversationStatus 表示会话生命周期状态（active/archived）。
 type ConversationStatus string
 
 const (
@@ -226,6 +227,7 @@ const (
 	ConversationArchived ConversationStatus = "archived"
 )
 
+// Conversation 是按目标档案隔离的一次连续诊断会话。
 type Conversation struct {
 	ID        string             `json:"id"`
 	ProfileID string             `json:"profileId"`
@@ -235,6 +237,7 @@ type Conversation struct {
 	UpdatedAt time.Time          `json:"updatedAt"`
 }
 
+// DiagnosticRequest 是前端发起一次诊断的请求载荷。
 type DiagnosticRequest struct {
 	Goal        string         `json:"goal"`
 	ProfileID   string         `json:"profileId"`

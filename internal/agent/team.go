@@ -77,8 +77,8 @@ type TeamFact struct {
 	Confidence  float64  `json:"confidence,omitempty"`
 }
 
-// TeamStepResult is the only information shared between workers. Their chat
-// histories remain isolated; large raw payloads stay in the Evidence store.
+// TeamStepResult 是 worker 之间唯一共享的信息。各 worker 的聊天历史互相隔离，
+// 大段原始负载仍保留在 Evidence 存储中。
 type TeamStepResult struct {
 	StepID      string     `json:"stepId"`
 	Role        string     `json:"role"`
@@ -91,6 +91,7 @@ type TeamStepResult struct {
 	SkipFrom    string     `json:"skipFrom,omitempty"`
 }
 
+// TeamWorkInput 是 worker 的输入：原始目标、当前步骤以及依赖步骤的结构化结果。
 type TeamWorkInput struct {
 	OriginalGoal string                    `json:"originalGoal"`
 	Step         TeamStep                  `json:"step"`
@@ -104,18 +105,22 @@ type TeamRunResult struct {
 	Results map[string]TeamStepResult `json:"results"`
 }
 
+// TeamPlanner 把诊断目标拆解成可并行执行的取证步骤 DAG。
 type TeamPlanner interface {
 	Plan(ctx context.Context, goal string) ([]TeamStep, error)
 }
 
+// TeamWorker 执行单个取证步骤并返回结构化结果。
 type TeamWorker interface {
 	Work(ctx context.Context, input TeamWorkInput) (TeamStepResult, error)
 }
 
+// TeamReviewer 汇总所有 worker 的结果，产出证据支撑的最终答案。
 type TeamReviewer interface {
 	Review(ctx context.Context, goal string, outputs map[string]TeamStepResult) (string, error)
 }
 
+// FuncPlanner 把普通函数适配成 TeamPlanner 接口。
 type FuncPlanner func(ctx context.Context, goal string) ([]TeamStep, error)
 
 func (f FuncPlanner) Plan(ctx context.Context, goal string) ([]TeamStep, error) { return f(ctx, goal) }

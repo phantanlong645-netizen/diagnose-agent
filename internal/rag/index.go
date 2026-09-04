@@ -196,6 +196,7 @@ func (i *Index) addGoSymbols(path, rel, text string) {
 	})
 }
 
+// Save 将索引以 JSON 格式写入 Path（自动创建父目录，文件权限 0600）。
 func (i *Index) Save() error {
 	if err := os.MkdirAll(filepath.Dir(i.Path), 0o700); err != nil {
 		return err
@@ -258,12 +259,15 @@ func (i *Index) RelationsFrom(rel string) []Relation {
 	return out
 }
 
+// Preview 返回 chunk 文本去掉首尾空白后最多 500 字符的预览。
 func (c Chunk) Preview() string {
 	return trimText(strings.TrimSpace(c.Text), 500)
 }
 
+// tokenRE 匹配索引分词 token：字母、数字、下划线或中文连续片段。
 var tokenRE = regexp.MustCompile(`[A-Za-z0-9_\p{Han}]+`)
 
+// terms 将文本小写化后按 tokenRE 分词计数，得到 TF 词频向量；长度不足 2 的 token 被忽略。
 func terms(s string) map[string]int {
 	out := map[string]int{}
 	for _, t := range tokenRE.FindAllString(strings.ToLower(s), -1) {

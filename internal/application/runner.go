@@ -281,16 +281,18 @@ func (r *Runner) Plan(conversationID string) (domain.DiagnosticPlan, bool, error
 	return r.journal.Plan(conversationID)
 }
 
+// SavePlan 持久化或更新诊断计划。
 func (r *Runner) SavePlan(plan domain.DiagnosticPlan) error {
 	return r.journal.SavePlan(plan)
 }
 
+// ToolFingerprint 查询指定会话与指纹对应的工具调用记录。
 func (r *Runner) ToolFingerprint(conversationID, fingerprint string) (domain.ToolFingerprint, bool, error) {
 	return r.journal.ToolFingerprint(conversationID, fingerprint)
 }
 
-// SaveTokenUsage persists one per-model-generation usage record collected by
-// the agent engine's token usage middleware.
+// SaveTokenUsage 持久化一条由 agent 引擎 token 用量中间件采集的
+// 单次模型生成用量记录。
 func (r *Runner) SaveTokenUsage(record domain.TokenUsageRecord) error {
 	return r.journal.SaveTokenUsage(record)
 }
