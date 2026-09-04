@@ -34,6 +34,8 @@ type mcpConfigFile struct {
 	MCPServers map[string]mcpServerConfig `json:"mcpServers"`
 }
 
+// mcpServerConfig 描述单个 MCP server 的启动方式：stdio 子进程（command/args/env）或
+// HTTP 端点（url/headers），两者至少配置其一。
 type mcpServerConfig struct {
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
@@ -171,6 +173,7 @@ func loadMCPConfig(configPath string) map[string]mcpServerConfig {
 	return merged
 }
 
+// startMCPServer 按配置选择传输：配置了 command 走 stdio，否则配置了 url 走 HTTP，两者皆无则报错。
 func startMCPServer(ctx context.Context, cfg mcpServerConfig) (mcpClient, error) {
 	if strings.TrimSpace(cfg.Command) != "" {
 		return startStdioMCP(ctx, cfg)
@@ -315,6 +318,7 @@ func (c *stdioMCPClient) Close() error {
 	return nil
 }
 
+// httpMCPClient 通过单次 HTTP POST 发送 JSON-RPC 请求（Streamable HTTP 的 stateless 子集）。
 type httpMCPClient struct {
 	url     string
 	headers map[string]string
@@ -382,6 +386,7 @@ func expandMCPVars(cfg *mcpServerConfig) {
 	}
 }
 
+// sanitizeMCPName 把名称中的 - 与 . 替换为 _，保证生成的本地名称可直接用作标识符。
 func sanitizeMCPName(s string) string {
 	s = strings.ReplaceAll(s, "-", "_")
 	s = strings.ReplaceAll(s, ".", "_")

@@ -2,9 +2,12 @@ package domain
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 )
 
+// RunStatus 表示诊断 run 的生命周期状态。
 type RunStatus string
 
 const (
@@ -15,6 +18,32 @@ const (
 	RunCancelled RunStatus = "cancelled"
 )
 
+// DiagnosticMode 选择单次 run 的编排策略：Agent 保持原有单一 ReAct 循环；
+// Team 将复杂排查分发给隔离的只读 worker，并通过 DAG 汇总它们的证据。
+type DiagnosticMode string
+
+const (
+	DiagnosticModeAgent  DiagnosticMode = "agent"
+	DiagnosticModeTeam   DiagnosticMode = "team"
+	DiagnosticModeManual DiagnosticMode = "manual"
+)
+
+// NormalizeDiagnosticMode 规范化诊断模式字符串：空串视为 agent，转为小写
+// 后与三个合法值匹配，其余返回错误。
+func NormalizeDiagnosticMode(mode DiagnosticMode) (DiagnosticMode, error) {
+	switch DiagnosticMode(strings.ToLower(strings.TrimSpace(string(mode)))) {
+	case "", DiagnosticModeAgent:
+		return DiagnosticModeAgent, nil
+	case DiagnosticModeTeam:
+		return DiagnosticModeTeam, nil
+	case DiagnosticModeManual:
+		return DiagnosticModeManual, nil
+	default:
+		return "", fmt.Errorf("unsupported diagnostic mode: %s", mode)
+	}
+}
+
+// EventType 表示诊断事件流中的事件类别（run、tool、approval、team 等）。
 type EventType string
 
 const (
@@ -28,11 +57,15 @@ const (
 	EventToolCompleted    EventType = "tool.completed"
 	EventToolFailed       EventType = "tool.failed"
 	EventFindingProduced  EventType = "finding.produced"
+	EventTeamPlanned      EventType = "team.planned"
+	EventTeamStepStarted  EventType = "team.step.started"
+	EventTeamStepFinished EventType = "team.step.finished"
 	EventRunCompleted     EventType = "run.completed"
 	EventRunFailed        EventType = "run.failed"
 	EventRunCancelled     EventType = "run.cancelled"
 )
 
+// ToolAnnotations 描述工具调用的安全特性，供策略引擎与并发/缓存控制使用。
 type ToolAnnotations struct {
 	ReadOnly    bool `json:"readOnly"`
 	Destructive bool `json:"destructive"`
@@ -41,12 +74,14 @@ type ToolAnnotations struct {
 	Sensitive   bool `json:"sensitive"`
 }
 
+// ToolCall 是 agent 对一次工具调用的请求描述。
 type ToolCall struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+// PreparedCall 是完成校验与注解后的工具调用，附带面向模型和 UI 的摘要与预览。
 type PreparedCall struct {
 	ToolCall
 	Summary     string          `json:"summary"`
@@ -55,6 +90,7 @@ type PreparedCall struct {
 	Input       any             `json:"-"`
 }
 
+// ToolResult 是工具执行成功后的输出，包含摘要、数据与可选元信息。
 type ToolResult struct {
 	Summary  string            `json:"summary"`
 	Data     any               `json:"data,omitempty"`
@@ -62,9 +98,8 @@ type ToolResult struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
-// ContextFact is durable diagnostic memory. Unlike chat messages, facts are
-// keyed and replaceable, so compaction does not have to preserve duplicate
-// prose in order to retain an exact route, error, or evidence reference.
+// ContextFact 是持久的诊断记忆。与聊天消息不同，事实按键可替换，
+// 因此上下文压缩无需保留重复的叙述，也能保留精确的路径、错误或证据引用。
 type ContextFact struct {
 	ConversationID string    `json:"conversationId"`
 	Key            string    `json:"key"`
@@ -80,6 +115,8 @@ type ContextFact struct {
 	Revision       int       `json:"revision"`
 }
 
+// DiagnosticPlan 记录诊断进度：已完成检查、未解决问题与下一步动作，
+// 供恢复会话时继续推进。
 type DiagnosticPlan struct {
 	ConversationID      string    `json:"conversationId"`
 	Goal                string    `json:"goal"`
@@ -92,6 +129,8 @@ type DiagnosticPlan struct {
 	UpdatedAt           time.Time `json:"updatedAt"`
 }
 
+// ToolFingerprint 记录一次工具调用的指纹与对应证据 ID，用于同会话内
+// 跨 run 的只读结果复用。
 type ToolFingerprint struct {
 	ConversationID string    `json:"conversationId"`
 	Fingerprint    string    `json:"fingerprint"`
@@ -101,6 +140,21 @@ type ToolFingerprint struct {
 	LastSeen       time.Time `json:"lastSeen"`
 }
 
+// TokenUsageRecord 记录单次模型调用的 token 消耗与耗时，用于"每轮输入/输出/耗时"
+// 统计。它按 run 与 conversation 双维度归属，既能在诊断过程中累计，也能在事后查询。
+type TokenUsageRecord struct {
+	ID             string    `json:"id"`
+	RunID          string    `json:"runId"`
+	ConversationID string    `json:"conversationId"`
+	Iteration      int       `json:"iteration"`
+	InputTokens    int       `json:"inputTokens"`
+	OutputTokens   int       `json:"outputTokens"`
+	TotalTokens    int       `json:"totalTokens"`
+	ElapsedMS      int64     `json:"elapsedMs"`
+	RecordedAt     time.Time `json:"recordedAt"`
+}
+
+// ApprovalRequest 描述一次需要用户审批的工具调用。
 type ApprovalRequest struct {
 	ConversationID string          `json:"conversationId"`
 	RunID          string          `json:"runId"`
@@ -112,6 +166,7 @@ type ApprovalRequest struct {
 	Annotations    ToolAnnotations `json:"annotations"`
 }
 
+// Evidence 是工具执行捕获的证据：携带原始数据、摘要与遥测元信息。
 type Evidence struct {
 	ID         string            `json:"id"`
 	RunID      string            `json:"runId"`
@@ -124,6 +179,7 @@ type Evidence struct {
 	CapturedAt time.Time         `json:"capturedAt"`
 }
 
+// Finding 表示一条诊断结论，关联支撑它的证据 ID 列表。
 type Finding struct {
 	ID          string   `json:"id"`
 	Title       string   `json:"title"`
@@ -132,6 +188,7 @@ type Finding struct {
 	EvidenceIDs []string `json:"evidenceIds"`
 }
 
+// Event 是持久化与推送的事件日志条目。
 type Event struct {
 	ID             string    `json:"id"`
 	ConversationID string    `json:"conversationId"`
@@ -141,11 +198,13 @@ type Event struct {
 	Payload        any       `json:"payload,omitempty"`
 }
 
+// Run 是一次诊断执行会话的状态与元数据。
 type Run struct {
 	ID             string            `json:"id"`
 	ConversationID string            `json:"conversationId"`
 	ProfileID      string            `json:"profileId"`
 	Goal           string            `json:"goal"`
+	Mode           DiagnosticMode    `json:"mode"`
 	Images         []ImageAttachment `json:"images,omitempty"`
 	Status         RunStatus         `json:"status"`
 	StartedAt      time.Time         `json:"startedAt"`
@@ -177,9 +236,10 @@ type Conversation struct {
 }
 
 type DiagnosticRequest struct {
-	Goal        string       `json:"goal"`
-	ProfileID   string       `json:"profileId"`
-	Attachments []Attachment `json:"attachments,omitempty"`
+	Goal        string         `json:"goal"`
+	ProfileID   string         `json:"profileId"`
+	Mode        DiagnosticMode `json:"mode,omitempty"`
+	Attachments []Attachment   `json:"attachments,omitempty"`
 }
 
 // ManualDraftMessage is one turn in the short-lived AI request-builder chat.

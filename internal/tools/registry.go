@@ -34,11 +34,13 @@ type TargetResolver interface {
 	WorkspaceRoots(profileID string) ([]string, bool)
 }
 
+// Registry 是线程安全的工具注册表，按名称保存所有已注册工具。
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool
 }
 
+// NewRegistry 创建一个空的工具注册表。
 func NewRegistry() *Registry {
 	return &Registry{tools: make(map[string]Tool)}
 }
@@ -72,6 +74,7 @@ func (r *Registry) Definitions() []Definition {
 	return definitions
 }
 
+// Prepare 按名查找工具并解析参数，返回已装配的 PreparedCall（审批与执行由调用方负责）。
 func (r *Registry) Prepare(call domain.ToolCall) (Tool, domain.PreparedCall, error) {
 	r.mu.RLock()
 	tool, exists := r.tools[call.Name]

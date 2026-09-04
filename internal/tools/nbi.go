@@ -66,6 +66,7 @@ type NBIRequest struct {
 	Body      string            `json:"body,omitempty"`
 }
 
+// NBIResponse 是 nbi_request 的执行结果：状态码、脱敏后的响应头/体与耗时等元信息。
 type NBIResponse struct {
 	RequestURL     string              `json:"requestUrl"`
 	StatusCode     int                 `json:"statusCode"`
@@ -117,6 +118,8 @@ type AccessConsoleLogsResponse struct {
 	Redirects       []string                      `json:"redirects,omitempty"`
 }
 
+// NBITool 是 nbi_request 工具：对 Access Console 北向 API 发起 HTTP 调用，
+// 内建 JWT 登录缓存、续期与响应脱敏能力。
 type NBITool struct {
 	targets TargetResolver
 	client  *http.Client

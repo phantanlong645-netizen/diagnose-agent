@@ -85,6 +85,7 @@ export namespace domain {
 	export class DiagnosticRequest {
 	    goal: string;
 	    profileId: string;
+	    mode?: string;
 	    attachments?: Attachment[];
 	
 	    static createFrom(source: any = {}) {
@@ -95,6 +96,7 @@ export namespace domain {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.goal = source["goal"];
 	        this.profileId = source["profileId"];
+	        this.mode = source["mode"];
 	        this.attachments = this.convertValues(source["attachments"], Attachment);
 	    }
 	
@@ -479,6 +481,7 @@ export namespace domain {
 	    conversationId: string;
 	    profileId: string;
 	    goal: string;
+	    mode: string;
 	    images?: ImageAttachment[];
 	    status: string;
 	    // Go type: time
@@ -496,6 +499,7 @@ export namespace domain {
 	        this.conversationId = source["conversationId"];
 	        this.profileId = source["profileId"];
 	        this.goal = source["goal"];
+	        this.mode = source["mode"];
 	        this.images = this.convertValues(source["images"], ImageAttachment);
 	        this.status = source["status"];
 	        this.startedAt = this.convertValues(source["startedAt"], null);

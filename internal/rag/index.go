@@ -24,13 +24,17 @@ import (
 	"strings"
 )
 
+// Index 是代码语义索引：保存被索引文件的 chunk 集合及其相互依赖关系，
+// 支持内存构建（BuildRoots）与 JSON 持久化（Save/Load）。
 type Index struct {
-	Path   string     `json:"-"`
-	Roots  []string   `json:"roots"`
-	Chunks []Chunk    `json:"chunks"`
+	Path      string     `json:"-"`
+	Roots     []string   `json:"roots"`
+	Chunks    []Chunk    `json:"chunks"`
 	Relations []Relation `json:"relations"`
 }
 
+// Chunk 是索引中的一个文本片段，可对应整个文件或单个 Go 函数；
+// Terms 为预计算的 TF 词频向量，避免检索时重复分词。
 type Chunk struct {
 	Path      string         `json:"path"`
 	StartLine int            `json:"start_line"`
@@ -41,17 +45,20 @@ type Chunk struct {
 	Terms     map[string]int `json:"terms"`
 }
 
+// Relation 表示两个对象之间的一条代码关系（如 imports / contains）。
 type Relation struct {
 	From string `json:"from"`
 	To   string `json:"to"`
 	Kind string `json:"kind"`
 }
 
+// Result 是一次搜索命中的 chunk 及其相关度分数（越大越相关）。
 type Result struct {
 	Chunk Chunk
 	Score float64
 }
 
+// NewIndex 创建索引，path 为 Save/Load 使用的持久化文件路径。
 func NewIndex(path string) *Index {
 	return &Index{Path: path}
 }
@@ -96,6 +103,8 @@ func (i *Index) BuildRoots(ctx context.Context, roots []string) error {
 	return nil
 }
 
+// walkRoot 递归遍历 root 下的文件：跳过常见构建产物/依赖目录，
+// 仅索引 isCodeFile 认可的文件，并在每步检查 ctx 以便构建可被取消。
 func (i *Index) walkRoot(ctx context.Context, root string) error {
 	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -121,6 +130,8 @@ func (i *Index) walkRoot(ctx context.Context, root string) error {
 	})
 }
 
+// addFile 将单个文件作为整文件 chunk 加入索引，路径记录为相对 root 的形式；
+// .go 文件额外解析 AST 提取函数级 chunk 与 import 关系。
 func (i *Index) addFile(root, path string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -147,6 +158,8 @@ func (i *Index) addFile(root, path string) error {
 	return nil
 }
 
+// addGoSymbols 解析 Go 源码 AST：为每个函数生成一个 chunk
+// （符号名为"接收者.函数名"），并记录"文件包含符号"与"文件导入依赖"两类关系。
 func (i *Index) addGoSymbols(path, rel, text string) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, text, parser.ParseComments)
@@ -194,6 +207,7 @@ func (i *Index) Save() error {
 	return os.WriteFile(i.Path, b, 0o600)
 }
 
+// Load 从 Path 读取并解析 JSON 格式的索引。
 func (i *Index) Load() error {
 	b, err := os.ReadFile(i.Path)
 	if err != nil {
@@ -287,6 +301,7 @@ func isCodeFile(path string) bool {
 	}
 }
 
+// trimText 将文本截断到 n 字节，超出部分以 "\n..." 结尾。
 func trimText(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -294,6 +309,7 @@ func trimText(s string, n int) string {
 	return s[:n] + "\n..."
 }
 
+// lines 提取文本中 [start, end] 行号区间的内容（行号从 1 开始）。
 func lines(text string, start, end int) string {
 	all := strings.Split(text, "\n")
 	if start < 1 {
@@ -308,6 +324,7 @@ func lines(text string, start, end int) string {
 	return strings.Join(all[start-1:end], "\n")
 }
 
+// exprString 将 AST 表达式还原为可读字符串（如 *pkg.Type.Receiver），用于拼接符号名。
 func exprString(expr ast.Expr) string {
 	switch x := expr.(type) {
 	case *ast.StarExpr:

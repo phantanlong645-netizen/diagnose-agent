@@ -19,12 +19,16 @@ import (
 	"olt-diagnostic-agent/internal/tools"
 )
 
+// ErrApprovalDeclined 表示工具调用被用户拒绝审批。
 var ErrApprovalDeclined = errors.New("tool execution approval declined")
 
+// EventSink 接收诊断事件并推送给 UI 客户端，用于实时展示运行进度。
 type EventSink interface {
 	Emit(event domain.Event)
 }
 
+// RunJournal 定义诊断运行在 SQLite 中的持久化接口：保存 run、事件、
+// 上下文快照、上下文事实、诊断计划、工具指纹与 token 用量等。
 type RunJournal interface {
 	StartRun(run domain.Run, event domain.Event) error
 	FinishRun(run domain.Run, runError string, contextJSON []byte, event domain.Event) error
@@ -46,8 +50,12 @@ type RunJournal interface {
 	// 比如用户重开会话继续问同一个事实，命中 SQLite 里的 tool_fingerprints 后，
 	// 直接通过 evidence_id 拿回上一次的只读结果，不需要重新发 NBI/NETCONF 请求。
 	EvidenceByConversation(conversationID, evidenceID string) (domain.Evidence, bool, error)
+	SaveTokenUsage(record domain.TokenUsageRecord) error
+	TokenUsageByConversation(conversationID string) ([]domain.TokenUsageRecord, error)
 }
 
+// ApprovalHandler 处理工具调用的审批流程：弹出审批请求、等待用户决定，
+// 并记忆会话级授权以跳过后续重复审批。
 type ApprovalHandler interface {
 	Open(request domain.ApprovalRequest) error
 	Wait(ctx context.Context, callID string) (bool, error)
@@ -55,6 +63,8 @@ type ApprovalHandler interface {
 	ConversationApproved(conversationID string) bool
 }
 
+// Runner 是诊断运行的执行器：负责工具准备、策略评估、审批、并发闸门、
+// 只读结果复用，以及事件与证据的记录。
 type Runner struct {
 	registry *tools.Registry
 	policy   *policy.Engine
@@ -64,11 +74,40 @@ type Runner struct {
 
 	mu            sync.RWMutex
 	runs          map[string]domain.Run
+	terminalMu    sync.Mutex
 	toolExecution sync.RWMutex
 	evidenceMu    sync.RWMutex
 	reusable      map[string]domain.Evidence
 }
 
+type readOnlyExecutionKey struct{}
+type teamWorkerExecutionKey struct{}
+
+type teamWorkerExecution struct {
+	StepID string
+	Role   string
+}
+
+// WithReadOnlyExecution 将嵌套代理执行标记为"仅取证"模式。该守卫在工具
+// 准备之后基于宿主派生的注解强制执行，因此模型无法通过修改提示词或
+// 参数来绕过它。
+func WithReadOnlyExecution(ctx context.Context) context.Context {
+	return context.WithValue(ctx, readOnlyExecutionKey{}, true)
+}
+
+// WithTeamWorkerExecution 为工具与证据事件标记其归属的 worker（步骤与角色）。
+// 该元数据由编排层持有，因此并发 worker 事件可被可靠分组，
+// 无需从时间戳推断归属。
+func WithTeamWorkerExecution(ctx context.Context, stepID, role string) context.Context {
+	ctx = WithReadOnlyExecution(ctx)
+	return context.WithValue(ctx, teamWorkerExecutionKey{}, teamWorkerExecution{
+		StepID: strings.TrimSpace(stepID),
+		Role:   strings.TrimSpace(role),
+	})
+}
+
+// NewRunner 创建 Runner，注入工具注册表、策略引擎、持久化日志、事件推送
+// 与审批处理器。
 func NewRunner(registry *tools.Registry, policyEngine *policy.Engine, journal RunJournal, sink EventSink, approval ApprovalHandler) *Runner {
 	return &Runner{
 		registry: registry,
@@ -81,12 +120,19 @@ func NewRunner(registry *tools.Registry, policyEngine *policy.Engine, journal Ru
 	}
 }
 
-func (r *Runner) Start(goal, profileID, conversationID string, images ...domain.ImageAttachment) (domain.Run, error) {
+// Start 创建并启动一个新的诊断 run：规范化模式、持久化 run 与启动事件、
+// 记录目标事实和初始诊断计划，并清空跨 run 的只读证据已读记录。
+func (r *Runner) Start(goal, profileID, conversationID string, mode domain.DiagnosticMode, images ...domain.ImageAttachment) (domain.Run, error) {
+	normalizedMode, err := domain.NormalizeDiagnosticMode(mode)
+	if err != nil {
+		return domain.Run{}, err
+	}
 	run := domain.Run{
 		ID:             uuid.NewString(),
 		ConversationID: conversationID,
 		ProfileID:      profileID,
 		Goal:           goal,
+		Mode:           normalizedMode,
 		Images:         images,
 		Status:         domain.RunRunning,
 		StartedAt:      time.Now().UTC(),
@@ -123,6 +169,7 @@ func (r *Runner) Start(goal, profileID, conversationID string, images ...domain.
 	return publicRun(run), nil
 }
 
+// Fail 将运行中的 run 标记为失败，并持久化失败事件与错误信息。
 func (r *Runner) Fail(runID string, runErr error) (domain.Run, error) {
 	r.mu.Lock()
 	run, exists := r.runs[runID]
@@ -180,10 +227,23 @@ func (r *Runner) Cancel(runID string) (domain.Run, error) {
 	return public, nil
 }
 
+// PublishAgentMessage 发布一条 agent 的文本消息事件。
 func (r *Runner) PublishAgentMessage(runID, content string) error {
 	return r.publish(runID, domain.EventAgentMessage, map[string]string{"content": content})
 }
 
+// PublishTeamEvent 以父 run 为归属持久化一条结构化编排事件。
+// worker 从不绕过父 Runner，因此 UI 与恢复日志看到的是单一有序的证据轨迹。
+func (r *Runner) PublishTeamEvent(runID string, eventType domain.EventType, payload any) error {
+	switch eventType {
+	case domain.EventTeamPlanned, domain.EventTeamStepStarted, domain.EventTeamStepFinished:
+		return r.publish(runID, eventType, payload)
+	default:
+		return fmt.Errorf("unsupported team event type: %s", eventType)
+	}
+}
+
+// Run 返回内存中指定 runID 的当前运行状态。
 func (r *Runner) Run(runID string) (domain.Run, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -191,6 +251,7 @@ func (r *Runner) Run(runID string) (domain.Run, bool) {
 	return run, exists
 }
 
+// Context 返回指定会话最近保存的上下文快照。
 func (r *Runner) Context(conversationID string) ([]byte, bool, error) {
 	return r.journal.Context(conversationID)
 }
@@ -205,14 +266,17 @@ func (r *Runner) ResetEvidenceReads() {
 	}
 }
 
+// ContextFacts 返回指定会话的上下文事实列表（按最近出现时间倒序）。
 func (r *Runner) ContextFacts(conversationID string, limit int) ([]domain.ContextFact, error) {
 	return r.journal.ContextFacts(conversationID, limit)
 }
 
+// SaveContextFact 持久化一条上下文事实（持久记忆）。
 func (r *Runner) SaveContextFact(fact domain.ContextFact) error {
 	return r.journal.SaveContextFact(fact)
 }
 
+// Plan 返回指定会话最近保存的诊断计划。
 func (r *Runner) Plan(conversationID string) (domain.DiagnosticPlan, bool, error) {
 	return r.journal.Plan(conversationID)
 }
@@ -223,6 +287,17 @@ func (r *Runner) SavePlan(plan domain.DiagnosticPlan) error {
 
 func (r *Runner) ToolFingerprint(conversationID, fingerprint string) (domain.ToolFingerprint, bool, error) {
 	return r.journal.ToolFingerprint(conversationID, fingerprint)
+}
+
+// SaveTokenUsage persists one per-model-generation usage record collected by
+// the agent engine's token usage middleware.
+func (r *Runner) SaveTokenUsage(record domain.TokenUsageRecord) error {
+	return r.journal.SaveTokenUsage(record)
+}
+
+// TokenUsageByConversation returns per-turn token usage and latency rows.
+func (r *Runner) TokenUsageByConversation(conversationID string) ([]domain.TokenUsageRecord, error) {
+	return r.journal.TokenUsageByConversation(conversationID)
 }
 
 func (r *Runner) SaveToolFingerprint(record domain.ToolFingerprint) error {
@@ -263,6 +338,7 @@ func (r *Runner) Evidence(runID, evidenceID string) (domain.Evidence, bool, erro
 }
 
 func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall) (domain.Evidence, error) {
+	startedAt := time.Now()
 	run, exists := r.Run(runID)
 	if !exists {
 		return domain.Evidence{}, fmt.Errorf("run not found: %s", runID)
@@ -273,7 +349,14 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 
 	tool, prepared, err := r.registry.Prepare(call)
 	if err != nil {
-		if eventErr := r.failTool(runID, call, err); eventErr != nil {
+		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
+			return domain.Evidence{}, errors.Join(err, eventErr)
+		}
+		return domain.Evidence{}, err
+	}
+	if readOnly, _ := ctx.Value(readOnlyExecutionKey{}).(bool); readOnly && !prepared.Annotations.ReadOnly {
+		err = fmt.Errorf("team worker is read-only; tool call %s would change or control external state", call.Name)
+		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
 			return domain.Evidence{}, errors.Join(err, eventErr)
 		}
 		return domain.Evidence{}, err
@@ -284,6 +367,7 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 		"summary":     prepared.Summary,
 		"annotations": prepared.Annotations,
 	}
+	addTeamWorkerEventFields(ctx, publicCall)
 	if err = r.publish(runID, domain.EventToolProposed, publicCall); err != nil {
 		return domain.Evidence{}, err
 	}
@@ -291,7 +375,7 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 	decision := r.policy.Evaluate(prepared)
 	if !decision.Allowed {
 		err = errors.New(decision.Reason)
-		if eventErr := r.failTool(runID, call, err); eventErr != nil {
+		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
 			return domain.Evidence{}, errors.Join(err, eventErr)
 		}
 		return domain.Evidence{}, err
@@ -329,13 +413,13 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 			}
 			if r.approval == nil {
 				err = errors.New("approval handler is not configured")
-				if eventErr := r.failTool(runID, call, err); eventErr != nil {
+				if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
 					return domain.Evidence{}, errors.Join(err, eventErr)
 				}
 				return domain.Evidence{}, err
 			}
 			if err = r.approval.Open(request); err != nil {
-				if eventErr := r.failTool(runID, call, err); eventErr != nil {
+				if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
 					return domain.Evidence{}, errors.Join(err, eventErr)
 				}
 				return domain.Evidence{}, err
@@ -346,7 +430,7 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 			}
 			approved, approvalErr := r.approval.Wait(ctx, call.ID)
 			if approvalErr != nil {
-				if eventErr := r.failTool(runID, call, approvalErr); eventErr != nil {
+				if eventErr := r.failTool(ctx, runID, call, approvalErr); eventErr != nil {
 					return domain.Evidence{}, errors.Join(approvalErr, eventErr)
 				}
 				return domain.Evidence{}, approvalErr
@@ -355,7 +439,7 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 				if err = r.publish(runID, domain.EventApprovalResolved, map[string]any{"callId": call.ID, "approved": false}); err != nil {
 					return domain.Evidence{}, err
 				}
-				if eventErr := r.failTool(runID, call, ErrApprovalDeclined); eventErr != nil {
+				if eventErr := r.failTool(ctx, runID, call, ErrApprovalDeclined); eventErr != nil {
 					return domain.Evidence{}, errors.Join(ErrApprovalDeclined, eventErr)
 				}
 				return domain.Evidence{}, ErrApprovalDeclined
@@ -379,9 +463,11 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 			if err = r.publish(runID, domain.EventToolStarted, publicCall); err != nil {
 				return domain.Evidence{}, err
 			}
-			if err = r.publish(runID, domain.EventToolCompleted, map[string]any{
-				"callId": call.ID, "evidenceId": reused.ID, "reused": true,
-			}); err != nil {
+			if err = r.publish(runID, domain.EventToolCompleted, addTeamWorkerEventFields(ctx, map[string]any{
+				"callId": call.ID, "name": call.Name, "successful": true,
+				"summary": prepared.Summary, "evidenceId": reused.ID, "reused": true,
+				"elapsedMs": time.Since(startedAt).Milliseconds(),
+			})); err != nil {
 				return domain.Evidence{}, err
 			}
 			return reused, nil
@@ -405,9 +491,11 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 				if err = r.publish(runID, domain.EventToolStarted, publicCall); err != nil {
 					return domain.Evidence{}, err
 				}
-				if err = r.publish(runID, domain.EventToolCompleted, map[string]any{
-					"callId": call.ID, "evidenceId": storedEvidence.ID, "reused": true, "source": "sqlite",
-				}); err != nil {
+				if err = r.publish(runID, domain.EventToolCompleted, addTeamWorkerEventFields(ctx, map[string]any{
+					"callId": call.ID, "name": call.Name, "successful": true,
+					"summary": prepared.Summary, "evidenceId": storedEvidence.ID, "reused": true, "source": "sqlite",
+					"elapsedMs": time.Since(startedAt).Milliseconds(),
+				})); err != nil {
 					return domain.Evidence{}, err
 				}
 				return storedEvidence, nil
@@ -420,7 +508,7 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 	}
 	result, err := tool.Execute(ctx, prepared)
 	if err != nil {
-		if eventErr := r.failTool(runID, call, err); eventErr != nil {
+		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
 			return domain.Evidence{}, errors.Join(err, eventErr)
 		}
 		return domain.Evidence{}, err
@@ -437,13 +525,24 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 		Metadata:   result.Metadata,
 		CapturedAt: time.Now().UTC(),
 	}
+	if worker, ok := teamWorkerFromContext(ctx); ok {
+		if evidence.Metadata == nil {
+			evidence.Metadata = make(map[string]string, 2)
+		}
+		evidence.Metadata["team.worker_step_id"] = worker.StepID
+		evidence.Metadata["team.worker_role"] = worker.Role
+	}
 	if err = r.publish(runID, domain.EventEvidenceCaptured, evidence); err != nil {
 		return domain.Evidence{}, err
 	}
-	if err = r.publish(runID, domain.EventToolCompleted, map[string]any{
+	if err = r.publish(runID, domain.EventToolCompleted, addTeamWorkerEventFields(ctx, map[string]any{
 		"callId":     call.ID,
+		"name":       call.Name,
+		"successful": true,
+		"summary":    prepared.Summary,
 		"evidenceId": evidence.ID,
-	}); err != nil {
+		"elapsedMs":  time.Since(startedAt).Milliseconds(),
+	})); err != nil {
 		return domain.Evidence{}, err
 	}
 	if err = r.recordToolMemory(run, call, prepared, evidence); err != nil {
@@ -586,6 +685,8 @@ func canReuseToolResult(call domain.PreparedCall) bool {
 }
 
 func (r *Runner) Complete(runID string, contextJSON []byte) (domain.Run, error) {
+	r.terminalMu.Lock()
+	defer r.terminalMu.Unlock()
 	r.mu.Lock()
 	run, exists := r.runs[runID]
 	if !exists {
@@ -612,11 +713,13 @@ func (r *Runner) Complete(runID string, contextJSON []byte) (domain.Run, error) 
 	return public, nil
 }
 
-func (r *Runner) failTool(runID string, call domain.ToolCall, err error) error {
-	if publishErr := r.publish(runID, domain.EventToolFailed, map[string]any{
-		"callId": call.ID,
-		"error":  err.Error(),
-	}); publishErr != nil {
+func (r *Runner) failTool(ctx context.Context, runID string, call domain.ToolCall, err error) error {
+	if publishErr := r.publish(runID, domain.EventToolFailed, addTeamWorkerEventFields(ctx, map[string]any{
+		"callId":     call.ID,
+		"name":       call.Name,
+		"successful": false,
+		"error":      err.Error(),
+	})); publishErr != nil {
 		return publishErr
 	}
 	run, exists := r.Run(runID)
@@ -634,6 +737,19 @@ func (r *Runner) failTool(runID string, call domain.ToolCall, err error) error {
 		FirstSeen:      time.Now().UTC(),
 		LastSeen:       time.Now().UTC(),
 	})
+}
+
+func teamWorkerFromContext(ctx context.Context) (teamWorkerExecution, bool) {
+	worker, ok := ctx.Value(teamWorkerExecutionKey{}).(teamWorkerExecution)
+	return worker, ok && worker.StepID != ""
+}
+
+func addTeamWorkerEventFields(ctx context.Context, payload map[string]any) map[string]any {
+	if worker, ok := teamWorkerFromContext(ctx); ok {
+		payload["workerStepId"] = worker.StepID
+		payload["workerRole"] = worker.Role
+	}
+	return payload
 }
 
 func (r *Runner) publish(runID string, eventType domain.EventType, payload any) error {

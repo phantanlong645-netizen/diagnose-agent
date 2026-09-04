@@ -6,6 +6,7 @@ Local-first Windows workbench for diagnosing OLT provisioning failures. It combi
 
 - **Wails v2 desktop shell** with a React + TypeScript diagnostic console.
 - **Eino ReAct agent loop** driven by an OpenAI-compatible chat model.
+- **Explicit Deep Team mode** — an LLM planner builds a bounded DAG, isolated read-only workers investigate NETCONF, REST/logs, source/docs, or public-web evidence in parallel, and a reviewer joins structured results plus persisted evidence IDs.
 - **Built-in OLT diagnostic workflow** — works without any external skill files; optional trusted `SKILL.md` files can be attached per target profile.
 - **Typed tool connectors**:
   - `nbi_request` — Access Console NBI (read-only HTTP requests)
@@ -36,13 +37,14 @@ Local-first Windows workbench for diagnosing OLT provisioning failures. It combi
 - `internal/target` — target profile store.
 - `internal/rag` — semantic code search indexing.
 
-Model responses use non-streaming chat completion. A diagnostic run may use up to 64 agent iterations with no whole-run deadline; it continues until the task is complete, the user cancels it, or a genuinely user-only blocker remains. Conversation history is compacted automatically when it exceeds 48 messages or roughly 48,000 tokens, preserving the goal, evidence, failures, and pending work.
+Model responses use non-streaming chat completion. A standard diagnostic run may use up to 64 agent iterations with no whole-run deadline; it continues until the task is complete, the user cancels it, or a genuinely user-only blocker remains. Conversation history is compacted automatically when it exceeds 48 messages or 80% of the safe model-context budget, preserving the goal, evidence, failures, and pending work. Deep Team workers use isolated histories and at most 8 iterations each; only their structured results and evidence references are shared.
 
 Model configuration is verified with a small chat request (20-second window) before a run starts; invalid base URLs, API keys, and model names are rejected early.
 
 ## Security model
 
 - Relative NBI paths cannot escape the configured host.
+- Deep Team workers are host-enforced read-only even when an exposed NBI or NETCONF tool also supports state-changing operations in standard mode.
 - File tools cannot escape the configured workspace roots, including through symbolic links.
 - Shell commands start in an allowed workspace and always require approval, but are not an OS sandbox and may access anything permitted to the desktop process.
 - Target and model credentials are never returned in profile summaries, model settings, or diagnostic events.

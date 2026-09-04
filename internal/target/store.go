@@ -14,11 +14,13 @@ import (
 	"olt-diagnostic-agent/internal/domain"
 )
 
+// Store 是 target profile 的内存存储：以 profile ID 为键，用读写锁保证并发安全。
 type Store struct {
 	mu       sync.RWMutex
 	profiles map[string]domain.TargetProfile
 }
 
+// NewStore 创建空的 Store。
 func NewStore() *Store {
 	return &Store{profiles: make(map[string]domain.TargetProfile)}
 }
@@ -116,6 +118,7 @@ func (s *Store) Save(profile domain.TargetProfile) error {
 		profile.WorkspaceRoots[index] = canonicalRoot
 	}
 	for index, skillPath := range profile.SkillPaths {
+		// 校验受信 skill 文件：必须位于某 workspace root 内、文件名为 SKILL.md、可读且不超过 128 KiB。
 		absoluteSkill, err := filepath.Abs(strings.TrimSpace(skillPath))
 		if err != nil {
 			return fmt.Errorf("resolve skill path: %w", err)
@@ -139,6 +142,7 @@ func (s *Store) Save(profile domain.TargetProfile) error {
 		}
 		profile.SkillPaths[index] = canonicalSkill
 	}
+	// 深拷贝切片与指针字段后再存入，防止调用方持有的引用影响已保存的数据。
 	profile.WorkspaceRoots = append([]string(nil), profile.WorkspaceRoots...)
 	profile.SkillPaths = append([]string(nil), profile.SkillPaths...)
 	if profile.NBI != nil {
@@ -157,6 +161,9 @@ func (s *Store) Save(profile domain.TargetProfile) error {
 	return nil
 }
 
+// validateNETCONFSettings 校验并规范化一段 NETCONF 连接配置：必须有地址、
+// 用户名/密码与合法端口（缺省 830）；非 insecure 模式时还必须提供 known-hosts 文件。
+// label 用于错误信息中标识是单点 NETCONF 还是某个 endpoint。
 func validateNETCONFSettings(address *string, port *int, username *string, password, knownHostsFile string, insecureHostKey bool, label string) error {
 	*address = strings.TrimSpace(*address)
 	if *address == "" {
@@ -188,6 +195,7 @@ func (s *Store) WorkspaceRoots(profileID string) ([]string, bool) {
 	return append([]string(nil), profile.WorkspaceRoots...), true
 }
 
+// Skills 读取并返回 profile 所有受信 skill 文件的内容（单文件上限 128 KiB，读取出错时跳过该文件）。
 func (s *Store) Skills(profileID string) ([]string, bool) {
 	s.mu.RLock()
 	profile, exists := s.profiles[profileID]
@@ -237,6 +245,7 @@ func (s *Store) NETCONF(profileID string) (domain.NETCONFTarget, bool) {
 	return domain.NETCONFTarget{}, false
 }
 
+// NETCONFEndpoints 返回 profile 的全部 NETCONF endpoint；只有单点配置时合成一个 "default" endpoint。
 func (s *Store) NETCONFEndpoints(profileID string) ([]domain.NETCONFEndpoint, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -262,6 +271,7 @@ func (s *Store) NETCONFEndpoints(profileID string) ([]domain.NETCONFEndpoint, bo
 	}}, true
 }
 
+// Exists 判断指定 ID 的 profile 是否已保存。
 func (s *Store) Exists(profileID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -361,6 +371,7 @@ func (s *Store) Profiles() []domain.TargetProfile {
 	return profiles
 }
 
+// cloneProfile 深拷贝一个 profile，断开切片与指针字段与存储数据的别名。
 func cloneProfile(stored domain.TargetProfile) domain.TargetProfile {
 	profile := stored
 	profile.WorkspaceRoots = append([]string(nil), stored.WorkspaceRoots...)
@@ -377,6 +388,7 @@ func cloneProfile(stored domain.TargetProfile) domain.TargetProfile {
 	return profile
 }
 
+// netconfTargetFromEndpoint 将 endpoint 字段映射为单点 NETCONF target。
 func netconfTargetFromEndpoint(endpoint domain.NETCONFEndpoint) domain.NETCONFTarget {
 	return domain.NETCONFTarget{
 		Address:         endpoint.Address,
@@ -388,6 +400,7 @@ func netconfTargetFromEndpoint(endpoint domain.NETCONFEndpoint) domain.NETCONFTa
 	}
 }
 
+// pathInsideRoots 判断 path 是否位于任一 root 之内（基于相对路径前缀判断）。
 func pathInsideRoots(path string, roots []string) bool {
 	for _, root := range roots {
 		relative, err := filepath.Rel(root, path)

@@ -198,10 +198,14 @@ func printPayload(typ string, payload []byte) {
 	case "tool.proposed":
 		var p struct {
 			CallID    string         `json:"callId"`
+			Name      string         `json:"name"`
 			Tool      string         `json:"tool"`
 			Arguments map[string]any `json:"arguments"`
 		}
 		if json.Unmarshal(payload, &p) == nil {
+			if p.Tool == "" {
+				p.Tool = p.Name
+			}
 			args, _ := json.Marshal(p.Arguments)
 			fmt.Printf("  tool: %s  callId: %s\n  args: %s\n", p.Tool, p.CallID, clip(string(args), 400))
 			return
@@ -209,24 +213,36 @@ func printPayload(typ string, payload []byte) {
 	case "tool.started":
 		var p struct {
 			CallID  string `json:"callId"`
+			Name    string `json:"name"`
 			Tool    string `json:"tool"`
 			Summary string `json:"summary"`
 		}
 		if json.Unmarshal(payload, &p) == nil {
+			if p.Tool == "" {
+				p.Tool = p.Name
+			}
 			fmt.Printf("  tool: %s  callId: %s  summary: %s\n", p.Tool, p.CallID, clip(p.Summary, 200))
 			return
 		}
 	case "tool.completed", "tool.failed":
 		var p struct {
 			CallID  string `json:"callId"`
+			Name    string `json:"name"`
 			Tool    string `json:"tool"`
-			Success bool   `json:"successful"`
+			Success *bool  `json:"successful"`
 			Summary string `json:"summary"`
 			Message string `json:"message"`
 			Error   string `json:"error"`
 		}
 		if json.Unmarshal(payload, &p) == nil {
-			fmt.Printf("  tool: %s  success: %v  callId: %s\n", p.Tool, p.Success, p.CallID)
+			if p.Tool == "" {
+				p.Tool = p.Name
+			}
+			success := typ == "tool.completed"
+			if p.Success != nil {
+				success = *p.Success
+			}
+			fmt.Printf("  tool: %s  success: %v  callId: %s\n", p.Tool, success, p.CallID)
 			if p.Summary != "" {
 				fmt.Printf("  summary: %s\n", clip(p.Summary, 300))
 			}
@@ -240,11 +256,15 @@ func printPayload(typ string, payload []byte) {
 		}
 	case "evidence.captured":
 		var e struct {
-			ID   string `json:"id"`
-			Kind string `json:"kind"`
-			Size int    `json:"size"`
+			ID   string          `json:"id"`
+			Kind string          `json:"kind"`
+			Size int             `json:"size"`
+			Data json.RawMessage `json:"data"`
 		}
 		if json.Unmarshal(payload, &e) == nil {
+			if e.Size == 0 {
+				e.Size = len(e.Data)
+			}
 			fmt.Printf("  evidenceId: %s  kind: %s  size: %d\n", e.ID, e.Kind, e.Size)
 			return
 		}
@@ -274,14 +294,18 @@ func findEvidence(db *sql.DB, evidenceID string) {
 		var payload []byte
 		ce(rows.Scan(&rid, &cid, &ts, &payload))
 		var e struct {
-			ID   string `json:"id"`
-			Kind string `json:"kind"`
-			Size int    `json:"size"`
+			ID   string          `json:"id"`
+			Kind string          `json:"kind"`
+			Size int             `json:"size"`
+			Data json.RawMessage `json:"data"`
 		}
 		if json.Unmarshal(payload, &e) != nil {
 			continue
 		}
 		if strings.Contains(e.ID, evidenceID) {
+			if e.Size == 0 {
+				e.Size = len(e.Data)
+			}
 			found = true
 			fmt.Printf("MATCH: evidenceId=%s  run=%s  conversation=%s  captured=%s  kind=%s  size=%d\n",
 				e.ID, rid, cid, ts, e.Kind, e.Size)

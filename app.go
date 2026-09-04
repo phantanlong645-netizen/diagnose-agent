@@ -160,6 +160,27 @@ func NewApp() (*App, error) {
 		}
 	}
 
+	// paicli-go 迁移能力：长期记忆（跨会话 + 关键词检索 + JSON 持久化）。
+	// 存储在 config.json 同目录的 memory.json，global 条目跨 profile 共享。
+	memoryStore, err := tools.NewMemoryStore(filepath.Join(filepath.Dir(app.configPath), "memory.json"))
+	if err != nil {
+		return nil, fmt.Errorf("load long-term memory: %w", err)
+	}
+	memorySaveTool, err := tools.NewMemorySaveTool(memoryStore)
+	if err != nil {
+		return nil, err
+	}
+	if err = app.registry.Register(memorySaveTool); err != nil {
+		return nil, err
+	}
+	memorySearchTool, err := tools.NewMemorySearchTool(memoryStore)
+	if err != nil {
+		return nil, err
+	}
+	if err = app.registry.Register(memorySearchTool); err != nil {
+		return nil, err
+	}
+
 	app.runner = application.NewRunner(app.registry, policy.NewEngine(), app.journal, app, app.approvals)
 	// read_evidence 接到 runner 而非 journal：runner.Evidence 在当前 run 未命中时
 	// 会回退到 EvidenceByConversation，从而让压缩摘要 / diagnostic-memory 里跨 run
@@ -446,6 +467,13 @@ func (a *App) StartDiagnostic(request domain.DiagnosticRequest) (domain.Run, err
 	if readiness := a.AgentReadiness(request.ProfileID); !readiness.Ready {
 		return domain.Run{}, fmt.Errorf("agent is not ready: %s", strings.Join(readiness.Issues, "; "))
 	}
+	mode, err := domain.NormalizeDiagnosticMode(request.Mode)
+	if err != nil || mode == domain.DiagnosticModeManual {
+		if err == nil {
+			err = errors.New("manual mode must use StartManualSession")
+		}
+		return domain.Run{}, err
+	}
 	// 处理附件：将文本/PDF 内容提取后拼装到 goal 前面，图片/二进制只注文件名提示
 	var images []domain.ImageAttachment
 	if len(request.Attachments) > 0 {
@@ -481,7 +509,7 @@ func (a *App) StartDiagnostic(request domain.DiagnosticRequest) (domain.Run, err
 		a.cancelMu.Unlock()
 		return domain.Run{}, err
 	}
-	run, err := a.runner.Start(request.Goal, request.ProfileID, conversation.ID, images...)
+	run, err := a.runner.Start(request.Goal, request.ProfileID, conversation.ID, mode, images...)
 	if err != nil {
 		a.cancelMu.Lock()
 		a.agentActive = false
@@ -505,7 +533,15 @@ func (a *App) StartDiagnostic(request domain.DiagnosticRequest) (domain.Run, err
 				_, _ = a.runner.Fail(run.ID, fmt.Errorf("diagnostic agent stopped unexpectedly: %v", recovered))
 			}
 		}()
-		_ = a.engine.Run(runContext, run.ID)
+		var runErr error
+		if mode == domain.DiagnosticModeTeam {
+			runErr = a.engine.RunTeam(runContext, run.ID)
+		} else {
+			runErr = a.engine.Run(runContext, run.ID)
+		}
+		if runErr != nil {
+			runtime.LogErrorf(a.ctx, "diagnostic run %s failed: %v", run.ID, runErr)
+		}
 	}()
 	return run, nil
 }
@@ -519,7 +555,7 @@ func (a *App) StartManualSession(profileID string) (domain.Run, error) {
 	if err != nil {
 		return domain.Run{}, err
 	}
-	return a.runner.Start("Manual diagnostic session", profileID, conversation.ID)
+	return a.runner.Start("Manual diagnostic session", profileID, conversation.ID, domain.DiagnosticModeManual)
 }
 
 // GenerateManualDraft turns a natural-language request into a locally

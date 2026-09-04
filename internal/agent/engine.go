@@ -23,22 +23,24 @@ import (
 	"encoding/json" // JSON 序列化：对话历史 checkpoint、工具入参编码、证据结构化输出
 	"errors"        // errors.Join 用于 fail() 合并多个错误
 	"fmt"           // 错误包装与字符串拼接
-	"net/http"      // Eino OpenAI 客户端需要一个 *http.Client
-	"regexp"        // sanitizeModelMessages 用的敏感字段正则
-	"strings"       // 字符串处理：TrimSpace、Replace、Builder 等
-	"sync"          // sync.RWMutex：保护 Engine 的可热替换字段（model、settings、config）
-	"sync/atomic"   // 按实际 ChatModel 生成次数统计单次 run 的 agent 迭代
-	"time"          // 用于 configure 验证模型时构造超时 ctx
+	"log/slog"
+
+	// 结构化记录模型调用失败与关键运行指标
+	"net/http"    // Eino OpenAI 客户端需要一个 *http.Client
+	"regexp"      // sanitizeModelMessages 用的敏感字段正则
+	"strings"     // 字符串处理：TrimSpace、Replace、Builder 等
+	"sync"        // sync.RWMutex：保护 Engine 的可热替换字段（model、settings、config）
+	"sync/atomic" // 按实际 ChatModel 生成次数统计单次 run 的 agent 迭代
+	"time"        // 用于 configure 验证模型时构造超时 ctx
 
 	openai "github.com/cloudwego/eino-ext/components/model/openai" // Eino 自带的 OpenAI 兼容模型客户端
 	"github.com/cloudwego/eino/adk"                                // Agent Development Kit：ChatModelAgent / Runner / 中间件
-	"github.com/cloudwego/eino/adk/middlewares/summarization"      // Eino 官方上下文摘要中间件
 	"github.com/cloudwego/eino/components/model"                   // model.ToolCallingChatModel 接口
 	einotool "github.com/cloudwego/eino/components/tool"           // Eino 工具接口（重命名为 einotool 避免与 internal/tools 冲突）
 	toolutils "github.com/cloudwego/eino/components/tool/utils"    // InferTool：用 struct 反射自动生成 JSON schema
-	jsonschema "github.com/eino-contrib/jsonschema"                // 把 MCP 的 map 形式 inputSchema 转成 Eino 认可的 JSON schema
 	"github.com/cloudwego/eino/compose"                            // ToolMiddleware / ToolNodeConfig
 	"github.com/cloudwego/eino/schema"                             // schema.Message / schema.ToolCall 等消息协议
+	jsonschema "github.com/eino-contrib/jsonschema"                // 把 MCP 的 map 形式 inputSchema 转成 Eino 认可的 JSON schema
 	"github.com/google/uuid"                                       // 工具调用 ID 需要稳定 UUID，供前端事件流关联
 
 	"olt-diagnostic-agent/internal/application"           // application.Runner：负责 run/事件发布/上下文落库
@@ -80,9 +82,8 @@ const (
 	// softStopIterationThreshold 软约束阈值（按 ChatModel 生成次数计）。
 	// 到达后不会强制停止 agent：证据充分时应直接总结；证据不足时仍可针对明确缺口继续取证。
 	softStopIterationThreshold = 24
-	// Keep the summary-model request bounded. Raw tool results remain in the
-	// journal; only compact diagnostic facts are sent to the summary model.
-	// 摘要模型请求总输入上限：超过此值会通过"丢弃中间块 + 留首尾"的方式截断。
+	// 摘要模型请求总输入上限。原始工具结果仍完整留在 event journal / 证据表中，
+	// 只有压缩后的诊断事实会被发送给摘要模型；超过此上限时通过"丢弃中间块、保留首尾"截断。
 	summaryInputMaxBytes = 32 * 1024
 	// 单条消息内容在摘要输入中的最大字节数。
 	summaryMessageMaxBytes = 8 * 1024
@@ -141,10 +142,9 @@ The selected target may expose multiple NETCONF endpoints on different SSH ports
 Explain conclusions using the evidence IDs returned by tools. Clearly distinguish observed facts from inference.
 Stop when the available evidence answers the goal or when a required credential, target, or capability is missing.`
 
-// projectOrientation is deliberately small and stable. It gives the model a
-// navigation index for the Access Console repository so it can jump to the
-// owning module instead of repeatedly scanning the whole workspace. Detailed
-// source and API text remains evidence and is fetched only when needed.
+// projectOrientation 刻意保持短小稳定。它给模型提供一份 Access Console 仓库的
+// 导航索引，让模型能直接跳到所属模块，而不是反复扫描整个工作区。
+// 详细的源码和 API 文本仍然只属于证据，按需抓取即可。
 const projectOrientation = `Access Console repository navigation map (use this before workspace search):
 - REST API contract (first lookup for an unverified REST request): server/internal/routers/nbi/doc/REST_API_Doc_V0618.md. Search it with search_files using the exact filename plus a path fragment or distinctive business keyword. Never read the whole 277 KB document. Reuse a contract already verified in the current conversation. For writes, ambiguous entries, missing entries, or version conflicts, continue to the focused registered router/controller below.
 - REST route registration: server/internal/routers/nbi/**/routers.go and provisioning.go. Use this to verify the exact HTTP method and path parameters.
@@ -245,9 +245,11 @@ type conversationRecorder struct {
 	pendingResults  map[string]*schema.Message // 已经回包的 tool result，key=ToolCallID
 }
 
-// modelIterationTracker counts successful main-agent ChatModel generations.
-// Tool results are deliberately not used here because one model iteration can
-// emit multiple parallel tool calls.
+// modelIterationTracker 统计主诊断 agent 成功完成的 ChatModel 生成次数（迭代数）。
+//
+// 注意：这里刻意不统计工具结果（tool result）。因为模型一次迭代可能触发多个
+// 并行的 tool call，如果按工具结果计数，一次模型推理就会被重复计算多次，
+// 无法反映"模型真正思考了多少轮"。
 type modelIterationTracker struct {
 	*adk.BaseChatModelAgentMiddleware
 
@@ -262,8 +264,8 @@ func (t *modelIterationTracker) AfterModelRewriteState(ctx context.Context, stat
 		return ctx, state, nil
 	}
 	last := state.Messages[len(state.Messages)-1]
-	// A direct final response has already converged and needs no warning. Notify
-	// only when the threshold iteration requests more tool work.
+	// 最后一条消息已经是"直接给出结论"（assistant 且没有 tool call），说明模型已经收敛，
+	// 不需要再发软停提示。只有当阈值这一轮模型仍在请求更多工具工作时才提示。
 	if last.Role == schema.Assistant && len(last.ToolCalls) > 0 {
 		if err := t.onSoftThreshold(iteration); err != nil {
 			return ctx, state, err
@@ -280,9 +282,75 @@ func softConstraintMessage(completedIterations int64) *schema.Message {
 	return schema.SystemMessage(fmt.Sprintf(`Soft diagnostic iteration threshold reached: %d model iterations have completed. Reassess the current evidence before taking another action. If the evidence already supports a defensible answer, stop calling tools and give the conclusion now. If evidence is genuinely insufficient, you may continue, but state the exact unresolved evidence gap and choose only a tool call that can close that gap. Do not repeat completed lookups or call a tool merely to "double-check" an already supported conclusion.`, completedIterations))
 }
 
-// mergeSystemMessages preserves the authority and order of independently built
-// system prompt sections while emitting the single leading system message
-// required by stricter OpenAI-compatible providers.
+// tokenUsageTracker 记录每次模型生成的 token 用量与耗时。
+//
+// Eino 在模型调用完成后，把用量信息挂在 schema.Message.ResponseMeta.Usage 上。
+// 本中间件在调用前通过 context 值快照开始时间（Eino 会把该 context 一路传播到
+// 模型调用和 After 钩子），然后在响应物化之后持久化一条 domain.TokenUsageRecord。
+type tokenUsageTracker struct {
+	*adk.BaseChatModelAgentMiddleware
+
+	runID          string
+	conversationID string
+	iterations     atomic.Int64
+	onRecord       func(domain.TokenUsageRecord) error
+}
+
+type tokenUsageStartKey struct{}
+
+func (t *tokenUsageTracker) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, _ *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
+	return context.WithValue(ctx, tokenUsageStartKey{}, time.Now()), state, nil
+}
+
+func (t *tokenUsageTracker) AfterModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, _ *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
+	usage := lastMessageUsage(state.Messages)
+	if usage == nil {
+		return ctx, state, nil
+	}
+	start, _ := ctx.Value(tokenUsageStartKey{}).(time.Time)
+	elapsedMS := int64(0)
+	if !start.IsZero() {
+		elapsedMS = time.Since(start).Milliseconds()
+	}
+	record := domain.TokenUsageRecord{
+		ID:             uuid.NewString(),
+		RunID:          t.runID,
+		ConversationID: t.conversationID,
+		Iteration:      int(t.iterations.Add(1)),
+		InputTokens:    usage.PromptTokens,
+		OutputTokens:   usage.CompletionTokens,
+		TotalTokens:    usage.TotalTokens,
+		ElapsedMS:      elapsedMS,
+		RecordedAt:     time.Now().UTC(),
+	}
+	if t.onRecord != nil {
+		if err := t.onRecord(record); err != nil {
+			return ctx, state, err
+		}
+	}
+	return ctx, state, nil
+}
+
+// lastMessageUsage 返回最近一次模型响应对应附带的 token 用量信息。
+// 有些 provider 不上报用量，此时 ResponseMeta.Usage 为 nil，应当跳过，
+// 避免单次缺失用量却伪造出一条"零 token"的记录。
+func lastMessageUsage(messages []*schema.Message) *schema.TokenUsage {
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
+		if message == nil || message.Role != schema.Assistant {
+			continue
+		}
+		if message.ResponseMeta != nil && message.ResponseMeta.Usage != nil {
+			return message.ResponseMeta.Usage
+		}
+		return nil
+	}
+	return nil
+}
+
+// mergeSystemMessages 把独立构建的多条 system prompt 片段合并成一条，
+// 既保留各片段的权威性和内在顺序，又满足严格 OpenAI 兼容 provider
+// 只接受"首条必须是一条 system 消息"的要求。
 func mergeSystemMessages(messages ...*schema.Message) *schema.Message {
 	parts := make([]string, 0, len(messages))
 	for _, message := range messages {
@@ -299,10 +367,9 @@ func mergeSystemMessages(messages ...*schema.Message) *schema.Message {
 	return schema.SystemMessage(strings.Join(parts, "\n\n"))
 }
 
-// modelMessagesWithLeadingSystem builds the provider payload with exactly one
-// system message at index zero. System messages retained by Eino state or old
-// SQLite checkpoints are stale copies of sections regenerated for every call,
-// so they must not be appended to the fresh prompt.
+// modelMessagesWithLeadingSystem 构建发送给 provider 的消息数组，保证 index 0 位置
+// 恰好只有一条 system 消息。Eino state 或旧 SQLite checkpoint 里保留的 system
+// 消息是每次调用都会重新生成内容的过期副本，不能追加进新 prompt，必须剔掉。
 func modelMessagesWithLeadingSystem(systemParts []*schema.Message, history []*schema.Message) []*schema.Message {
 	safeHistory := sanitizeModelMessages(history)
 	messages := make([]*schema.Message, 0, len(safeHistory)+1)
@@ -382,8 +449,8 @@ func (r *conversationRecorder) captureModelState(messages []*schema.Message) err
 				r.pendingCalls = append(r.pendingCalls, call.ID)
 			}
 		}
-		// Do not write an assistant tool-call message by itself. A model history
-		// is only resumable after every corresponding tool result is present.
+		// 不能单独落一条"只有 assistant tool call、没有对应 tool result"的消息：
+		// 模型的对话历史只有在每个 tool call 都有对应 result 之后才可恢复。
 		r.mu.Unlock()
 		return nil
 	}
@@ -398,10 +465,10 @@ func (r *conversationRecorder) captureModelState(messages []*schema.Message) err
 	return r.save(cloned)
 }
 
-// ObserveToolResult completes the pending assistant/tool boundary emitted by
-// Eino. It is called from the event consumer after a tool event has been
-// materialized. Checkpointing waits until all calls in the assistant message
-// have a result, avoiding an invalid half-completed tool turn after a crash.
+// ObserveToolResult 补齐 Eino 发出的"assistant 已发 tool call、tool result 尚未全部回包"
+// 这个待完善边界。它由事件消费方在工具事件物化后调用。
+// 只有当 assistant 消息里的所有 tool call 都拿到对应 result 后才执行 checkpoint，
+// 从而避免崩溃后留下"半截工具轮次"的非法对话历史。
 func (r *conversationRecorder) ObserveToolResult(message *schema.Message) error {
 	// 非 tool 消息直接忽略（assistant/user 不需要在这里处理）。
 	if message == nil || message.Role != schema.Tool {
@@ -542,10 +609,10 @@ func sanitizeModelMessages(messages []*schema.Message) []*schema.Message {
 	return safe
 }
 
-// retainModelMessages prepares conversation history for checkpoints and summaries.
-// Binary multimodal payloads are request-scoped: keeping them in SQLite would resend
-// large Base64 blobs on every later turn. Text parts remain as ordinary Content and a
-// marker records that media was present without pretending it is still available.
+// retainModelMessages 为 checkpoint 与摘要准备可保留的对话历史。
+// 二进制的多模态负载是"单次请求"作用域：如果留在 SQLite 里，后续每一轮都会
+// 把大段 Base64 重新发给模型。文本部分保留为普通 Content，媒体部分用一个
+// 标记记录"当时有媒体"，而不假装它仍然可用。
 func retainModelMessages(messages []*schema.Message) []*schema.Message {
 	safe := sanitizeModelMessages(messages)
 	retained := make([]*schema.Message, 0, len(safe))
@@ -553,9 +620,8 @@ func retainModelMessages(messages []*schema.Message) []*schema.Message {
 		if message == nil {
 			continue
 		}
-		// The current instruction and diagnostic memory are regenerated before
-		// every provider call. Persisting them creates stale duplicate system
-		// messages on continuation and needlessly adds tens of KB per checkpoint.
+		// 当前指令与诊断记忆在每次模型调用前都会重新生成，把它们持久化会造成
+		// 续聊时的过期重复 system 消息，还会让每次 checkpoint 凭空多出几十 KB。
 		if message.Role == schema.System {
 			continue
 		}
@@ -647,6 +713,7 @@ func (e *Engine) Configure(ctx context.Context, settings domain.ModelSettings) (
 	return e.configure(ctx, settings, true)
 }
 
+// Restore 在服务启动加载持久化设置时调用：不验证模型连通性（避免启动期阻塞）。
 func (e *Engine) Restore(ctx context.Context, settings domain.ModelSettings) (domain.ModelSettingsSummary, error) {
 	return e.configure(ctx, settings, false)
 }
@@ -770,18 +837,8 @@ func (e *Engine) Configuration() (domain.ModelSettings, bool) {
 	return e.config, e.settings.Configured
 }
 
-// Run 是 Engine 的主入口：驱动一次完整诊断运行的全流程。
-//
-// 步骤拆解：
-//  1. 从 runner 拿到 run 详情（profile、conversation、goal）
-//  2. 加载/解码历史上下文，加 sanitization（防止历史里的敏感字段进模型）
-//  3. 拼上本轮 user goal；只有形成完整对话边界后才 checkpoint
-//  4. 构造工具集、summarization 中间件、conversationRecorder、ChatModelAgent
-//  5. 启动 Eino Runner，事件循环里：
-//     - 捕获 tool result → 通知 recorder 推进状态机
-//     - 达到软停阈值时发一次 UI 提示（不强制停）
-//     - assistant 消息剥掉 <think> 块后推送给前端
-//  6. 正常结束后把 finalMessages 落库并 Complete
+// manualDraftInstruction 是 Manual Builder 的专用指令：只允许构造只读请求草稿，
+// 不发起认证、不调用任何工具，且必须返回严格 JSON 形状。
 const manualDraftInstruction = `
 You are now the Manual request builder. Your only job is to turn the operator's natural-language request into one safe, read-only Manual form draft.
 You have no tools in this interaction. Do not authenticate, open an SSH connection, call an API, inspect files, or claim that you performed any of those actions.
@@ -800,10 +857,9 @@ Return exactly one JSON object, with no Markdown fence or extra prose, matching 
 {"message":"short explanation for the operator","draft":{"kind":"nbi|netconf","method":"GET|HEAD|OPTIONS","path":"/northbound/...","headers":{},"body":"","endpoint":"","rpc":"","timeoutSeconds":30}}
 For kind nbi, populate method/path/headers/body and leave endpoint/rpc empty. For kind netconf, populate endpoint/rpc/timeoutSeconds and leave method/path/body empty. A NETCONF get or get-config must include a narrow subtree filter. If information is missing, say exactly what is needed in message and return draft.kind as an empty string.`
 
-// GenerateManualDraft uses the configured model only to populate the existing
-// Manual form. It deliberately bypasses the agent tool loop; the generated
-// request is then checked locally through the same Prepare path used by real
-// execution, without touching the target.
+// GenerateManualDraft 仅用当前配置的模型来填充已有的 Manual 表单。
+// 它刻意绕开 agent 的工具循环：模型只负责生成请求草稿，随后生成的请求
+// 会通过与真实执行相同的 Prepare 路径在本地做只读校验，全程不触碰目标设备。
 func (e *Engine) GenerateManualDraft(ctx context.Context, request domain.ManualDraftRequest) (domain.ManualDraftResponse, error) {
 	request.ProfileID = strings.TrimSpace(request.ProfileID)
 	if _, exists := e.targets.Profile(request.ProfileID); request.ProfileID == "" || !exists {
@@ -856,6 +912,8 @@ type manualDraftModelResponse struct {
 	Draft   domain.ManualDraft `json:"draft"`
 }
 
+// validateManualDraft 解析模型返回的 JSON 草稿并按类型（nbi/netconf）规整字段，
+// 最后通过 PrepareTool 的只读校验确认草稿可执行且不触碰目标设备。
 func (e *Engine) validateManualDraft(profileID, content string) (domain.ManualDraftResponse, error) {
 	clean := strings.TrimSpace(content)
 	clean = strings.TrimPrefix(clean, "```json")
@@ -916,6 +974,7 @@ func (e *Engine) validateManualDraft(profileID, content string) (domain.ManualDr
 	return result, nil
 }
 
+// manualDraftToolCall 把 Manual 草稿转成对应工具（nbi_request / netconf_rpc）的入参 JSON。
 func manualDraftToolCall(profileID string, draft domain.ManualDraft) (string, []byte, error) {
 	if draft.Kind == "nbi" {
 		arguments, err := json.Marshal(diagnostictools.NBIRequest{
@@ -939,6 +998,18 @@ func manualDraftToolCall(profileID string, draft domain.ManualDraft) (string, []
 	return "", nil, errors.New("manual draft protocol is required")
 }
 
+// Run 是 Engine 的主入口：驱动一次完整诊断运行的全流程。
+//
+// 步骤拆解：
+//  1. 从 runner 拿到 run 详情（profile、conversation、goal）
+//  2. 加载/解码历史上下文，加 sanitization（防止历史里的敏感字段进模型）
+//  3. 拼上本轮 user goal；只有形成完整对话边界后才 checkpoint
+//  4. 构造工具集、summarization 中间件、conversationRecorder、ChatModelAgent
+//  5. 启动 Eino Runner，事件循环里：
+//     - 捕获 tool result → 通知 recorder 推进状态机
+//     - 达到软停阈值时发一次 UI 提示（不强制停）
+//     - assistant 消息剥掉  thinking 块后推送给前端
+//  6. 正常结束后把 finalMessages 落库并 Complete
 func (e *Engine) Run(ctx context.Context, runID string) error {
 	// 1) 解析 run 上下文：必须存在 run、必须指定了 profile。
 	run, exists := e.runner.Run(runID)
@@ -971,8 +1042,8 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 		if err = json.Unmarshal(contextJSON, &messages); err != nil {
 			return e.fail(runID, fmt.Errorf("decode conversation context: %w", err))
 		}
-		// Older checkpoints may contain credentials or credential-shaped shell
-		// fragments. Sanitize them before they can reach the provider.
+		// 早期 checkpoint 里可能残留密钥或形似凭据的 shell 片段，
+		// 先 sanitize 再进入模型，防止它们触达 provider。
 		messages = sanitizeModelMessages(messages)
 		// 提示用户"已恢复 N 条历史"，让他知道这是续聊而非新会话。
 		if err = e.runner.PublishAgentMessage(runID, fmt.Sprintf("Continuing this target conversation with %d retained context messages.", len(messages))); err != nil {
@@ -986,45 +1057,19 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 	if err != nil {
 		return e.fail(runID, err)
 	}
-	// 摘要重试次数：只允许 1 次。摘要本身就是 fallback，再循环会让慢的 run 显得卡死。
-	// Summary generation is a fallback, not a second long-running diagnostic
-	// loop. One retry is enough; additional provider calls make a slow run feel
-	// stuck and can repeat the same provider-side failure.
-	summaryRetries := 1
 	e.mu.RLock()
 	modelSettings := e.config
 	e.mu.RUnlock()
-	// 7) summarization 中间件：上下文逼近窗口上限时自动压缩。
-	summaryMiddleware, err := summarization.New(ctx, &summarization.Config{
-		Model: chatModel,
-		Trigger: &summarization.TriggerCondition{
-			// token 维度用我们自己的算法（contextSummaryTriggerTokens），不依赖 Eino 默认。
-			ContextTokens:   contextSummaryTriggerTokens(modelSettings),
-			ContextMessages: contextSummaryMessageThreshold,
+	// 7) 自定义诊断上下文管理：业务层决定何时压缩、保留什么以及摘要是否可接受。
+	summaryMiddleware := &contextManager{
+		model:           chatModel,
+		memory:          func() (*schema.Message, error) { return e.diagnosticMemoryMessage(run.ConversationID) },
+		triggerTokens:   contextSummaryTriggerTokens(modelSettings),
+		triggerMessages: contextSummaryMessageThreshold,
+		minNewMessages:  8,
+		onFailure: func(summaryErr error) {
+			slog.Warn("diagnostic context compaction failed; retaining original state", "run_id", runID, "conversation_id", run.ConversationID, "error", summaryErr)
 		},
-		TokenCounter: diagnosticContextTokenCounter,
-		// GenModelInput 决定摘要时发给模型的输入。系统说明 + 诊断记忆 + 投影后历史 + 用户说明。
-		GenModelInput: func(_ context.Context, systemInstruction, userInstruction *schema.Message, originalMessages []*schema.Message) ([]*schema.Message, error) {
-			// 1. 投影：去掉重复 system instruction，压缩每条消息大小，保留首尾重要片段。
-			projected := projectMessagesForSummary(originalMessages)
-			// 2. 拉取诊断记忆（plan + facts），作为 pinned 上下文。
-			memory, memoryErr := e.diagnosticMemoryMessage(run.ConversationID)
-			if memoryErr != nil {
-				return nil, memoryErr
-			}
-			// 3. 拼装：合并后的唯一 system + 投影 + user。
-			history := append(projected, userInstruction)
-			return modelMessagesWithLeadingSystem([]*schema.Message{systemInstruction, memory}, history), nil
-		},
-		UserInstruction: `Create a compact continuation summary for this OLT diagnostic run. The pinned diagnostic-memory message is authoritative and must not be contradicted or discarded. Return exactly these labeled sections: goal; target; confirmed_facts; observed_errors; rejected_hypotheses; completed_checks; open_questions; next_action; do_not_repeat. Preserve exact API routes, HTTP methods/statuses, RPC operation/filter/XML identifiers, filenames and line numbers, endpoint IDs, error text, and evidence IDs when present. Mark unsupported conclusions as inferred or open. Do not invent values. Never include credentials, tokens, passwords, or other secrets. Prefer referencing an evidence ID over copying a large response. The next agent invocation must be able to continue without repeating a confirmed lookup. Goal anchoring rules (critical when this conversation spans multiple runs/goals): the goal section must be the MOST RECENT user request only, the single currently-active objective; any earlier user request whose work is finished is NOT the goal and belongs under completed_checks. next_action must advance only the current goal; if the current goal is already satisfied, set next_action to "goal already satisfied; verify and conclude" and never reintroduce steps from a prior goal. do_not_repeat may only block confirmed-redundant repeats of already-completed lookups; it must never suppress queries or calls that the current goal requires.`,
-		// Callback: 摘要完成后给前端发一条可见消息，告诉用户"压缩了多少条"。
-		Callback: func(_ context.Context, before, after adk.ChatModelAgentState) error {
-			return e.runner.PublishAgentMessage(runID, fmt.Sprintf("Context compacted: %d messages were summarized into %d messages. Diagnostic evidence and pending work were preserved.", len(before.Messages), len(after.Messages)))
-		},
-		Retry: &summarization.RetryConfig{MaxRetries: &summaryRetries},
-	})
-	if err != nil {
-		return e.fail(runID, fmt.Errorf("create context summarizer: %w", err))
 	}
 	iterationTracker := &modelIterationTracker{
 		BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
@@ -1034,6 +1079,15 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 				"已达到软约束阈值（%d 次模型迭代），距离 %d 次硬上限还剩 %d 次。模型将先检查现有证据：证据充分时直接给出结论；只有存在明确证据缺口时才继续查询。",
 				iteration, maxAgentIterations, int64(maxAgentIterations)-iteration,
 			))
+		},
+	}
+	// 统计每轮模型调用的 token 消耗与耗时，落库供事后按 run/conversation 汇总。
+	usageTracker := &tokenUsageTracker{
+		BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
+		runID:                        runID,
+		conversationID:               run.ConversationID,
+		onRecord: func(record domain.TokenUsageRecord) error {
+			return e.runner.SaveTokenUsage(record)
 		},
 	}
 	// 8) conversationRecorder：负责把 assistant 发出 tool call 后的"半截状态"挡在库外。
@@ -1084,7 +1138,7 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 		},
 		MaxIterations: maxAgentIterations, // 硬上限 64 轮
 		// 中间件顺序：先摘要，再统计真实模型迭代，最后由 recorder 落库。
-		Handlers: []adk.ChatModelAgentMiddleware{summaryMiddleware, iterationTracker, recorder},
+		Handlers: []adk.ChatModelAgentMiddleware{summaryMiddleware, iterationTracker, recorder, usageTracker},
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				Tools: agentTools,
@@ -1109,7 +1163,9 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 			break
 		}
 		if event.Err != nil {
-			return e.fail(runID, fmt.Errorf("Eino agent run: %w", explainModelProviderError(event.Err)))
+			explainedErr := explainModelProviderError(event.Err)
+			slog.Error("diagnostic agent event failed", "run_id", runID, "conversation_id", run.ConversationID, "error", explainedErr)
+			return e.fail(runID, fmt.Errorf("Eino agent run: %w", explainedErr))
 		}
 		message, _, messageErr := adk.GetMessage(event)
 		if messageErr != nil {
@@ -1150,9 +1206,9 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 	return err
 }
 
-// modelErrorIsRetryable limits retries to transient failures. Provider-side 4xx
-// errors such as invalid multimodal input are deterministic and must be returned
-// immediately instead of sending the same request four times.
+// modelErrorIsRetryable 限制重试只针对瞬时故障。provider 侧的 4xx 错误
+// （例如非法的多模态输入）是确定性的，必须立即返回给调用方，
+// 而不是把同一个请求重复发送四次浪费资源。
 func modelErrorIsRetryable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
@@ -1165,10 +1221,8 @@ func modelErrorIsRetryable(err error) bool {
 	return status == http.StatusRequestTimeout || status == http.StatusConflict || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
 }
 
-// diagnosticMemoryMessage 拉取本会话的诊断记忆（plan + facts），渲染成 system message。
-//
-// 诊断记忆以 pinned 形式注入：每次 GenModelInput 都会重新拉取，所以即便 summarization
-// 把原始 user/assistant 消息压缩了，plan 和 facts 仍然在每一轮提示中可见。
+// buildUserMessage 构造本轮发给模型的 user 消息：纯文本时直接使用 goal；
+// 附带截图时把图片编码为多模态消息片段追加在 goal 之后。
 func buildUserMessage(run domain.Run) *schema.Message {
 	if len(run.Images) == 0 {
 		return schema.UserMessage(run.Goal)
@@ -1193,7 +1247,11 @@ func buildUserMessage(run domain.Run) *schema.Message {
 	}
 }
 
-// 返回 nil 表示"没有可注入的诊断记忆"（首次 run 或 plan/facts 都为空）。
+// diagnosticMemoryMessage 拉取本会话的诊断记忆（plan + facts），渲染成 system message。
+//
+// 诊断记忆以 pinned 形式注入：每次 GenModelInput 都会重新拉取，所以即便 summarization
+// 把原始 user/assistant 消息压缩了，plan 和 facts 仍然在每一轮提示中可见。
+// 返回 nil 表示"没有可注入的诊断记忆"（首次 run 或 plan/facts 都为空）；
 // 返回 *schema.Message 时 Role=System，模型会当成不可覆盖的指令。
 func (e *Engine) diagnosticMemoryMessage(conversationID string) (*schema.Message, error) {
 	plan, planExists, err := e.runner.Plan(conversationID)
@@ -1567,12 +1625,47 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino code-search tool: %w", err)
 	}
 
+	// paicli-go 迁移能力：长期记忆。memory_save 只维护本地记忆、不触碰目标设备，
+	// 由 policy 自动放行；memory_search 只读检索 global + 当前 profile 的持久化事实。
+	memorySaveTool, err := toolutils.InferTool("memory_save",
+		"Persist one durable fact to long-term cross-conversation memory for later sessions. Scope to the current profile by default, or set scope=global for target-independent facts.",
+		func(ctx context.Context, input memorySaveArguments) (agentToolObservation, error) {
+			arguments, marshalErr := json.Marshal(diagnostictools.MemorySaveRequest{
+				ProfileID: profileID,
+				Content:   input.Content,
+				Scope:     input.Scope,
+			})
+			if marshalErr != nil {
+				return agentToolObservation{}, marshalErr
+			}
+			return e.executeTool(ctx, runID, domain.ToolCall{ID: uuid.NewString(), Name: "memory_save", Arguments: arguments}), nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("create Eino memory-save tool: %w", err)
+	}
+	memorySearchTool, err := toolutils.InferTool("memory_search",
+		"Search long-term cross-conversation memory by keyword. Returns recent matching facts from the current profile plus global facts recorded by earlier sessions.",
+		func(ctx context.Context, input memorySearchArguments) (agentToolObservation, error) {
+			arguments, marshalErr := json.Marshal(diagnostictools.MemorySearchRequest{
+				ProfileID: profileID,
+				Query:     input.Query,
+				Limit:     input.Limit,
+			})
+			if marshalErr != nil {
+				return agentToolObservation{}, marshalErr
+			}
+			return e.executeTool(ctx, runID, domain.ToolCall{ID: uuid.NewString(), Name: "memory_search", Arguments: arguments}), nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("create Eino memory-search tool: %w", err)
+	}
+
 	// MCP 工具：从 registry 动态拉取，schema 直接来自 MCP server 的 inputSchema。
 	mcpTools, err := e.mcpEinoTools(runID)
 	if err != nil {
 		return nil, err
 	}
-	staticTools := []einotool.BaseTool{nbiTool, accessConsoleLogsTool, netconfTool, searchFilesTool, readFileTool, readEvidenceTool, writeFileTool, shellTool, webSearchTool, webFetchTool, searchCodeTool}
+	staticTools := []einotool.BaseTool{nbiTool, accessConsoleLogsTool, netconfTool, searchFilesTool, readFileTool, readEvidenceTool, writeFileTool, shellTool, webSearchTool, webFetchTool, searchCodeTool, memorySaveTool, memorySearchTool}
 	return append(staticTools, mcpTools...), nil
 }
 
@@ -1725,9 +1818,9 @@ type nbiArguments struct {
 	Body    string            `json:"body,omitempty" jsonschema:"description=Raw request body, normally JSON"`
 }
 
-// accessConsoleLogsArguments is intentionally narrower than a generic HTTP
-// request. The host owns authentication, the fixed route, archive validation,
-// extraction limits, and redaction; the model chooses only evidence filters.
+// accessConsoleLogsArguments 刻意比通用 HTTP 请求的参数更窄。
+// 认证、固定路由、归档校验、解压上限和脱敏都由宿主端负责；
+// 模型只需要选择证据过滤条件（日志文件名与关键字等）。
 type accessConsoleLogsArguments struct {
 	LogNames     []string `json:"logNames,omitempty" jsonschema:"description=Known Access Console log filenames to inspect; omit to inspect the current server bundle"`
 	Keywords     []string `json:"keywords,omitempty" jsonschema:"description=Case-insensitive OR keywords such as an API path error text OLT IP ONU serial or service identifier"`
@@ -1741,34 +1834,6 @@ type agentToolObservation struct {
 	Successful bool             `json:"successful"`
 	Evidence   *domain.Evidence `json:"evidence,omitempty"`
 	Error      string           `json:"error,omitempty"`
-}
-
-// diagnosticContextTokenCounter 是 summarization 中间件的 token 估算器。
-//
-// 故意按"原始 message（含 tool result + 工具 schema）"算，而不是按"摘要后的输入"算。
-// 原因：摘要触发要早于实际成本失控。即便最后摘要输入被压缩成几 KB，触发前的原
-// 始上下文可能已经超过 100KB，必须在那之前就触发压缩。
-//
-// 估算公式：每条消息按"内容字节数 / 4"粗算（英文/代码 ≈ 4 字节/token），tool_call
-// 额外加 32 字节估算 ID+name+type 开销。
-func diagnosticContextTokenCounter(_ context.Context, input *summarization.TokenCounterInput) (int, error) {
-	totalBytes := 0
-	for _, message := range input.Messages {
-		if message == nil {
-			continue
-		}
-		totalBytes += modelMessageBytes(message)
-	}
-	// 工具 schema 也要计入：每个 tool 一次 Marshal。
-	for _, tool := range input.Tools {
-		encoded, err := json.Marshal(tool)
-		if err != nil {
-			return 0, fmt.Errorf("encode tool schema for context counting: %w", err)
-		}
-		totalBytes += len(encoded)
-	}
-	// 4 字节/token 估算。
-	return (totalBytes + 3) / 4, nil
 }
 
 // contextSummaryTriggerTokens 计算"多少 tokens 时触发摘要"。
@@ -1972,9 +2037,9 @@ func messageBlockBytes(block []*schema.Message) int {
 	return total
 }
 
-// modelMessageBytes estimates textual context plus a bounded cost per media part.
-// Base64 length is not a valid visual-token count, so counting the encoded bytes
-// directly would trigger summarization before the model can inspect the image.
+// modelMessageBytes 估算文本上下文总量，并为每个媒体片段计一个有上限的成本。
+// Base64 的长度不能真实反映视觉 token 数，因此不能直接统计编码后的字节，
+// 否则会在模型还没来得及看图之前就误触发摘要压缩。
 func modelMessageBytes(message *schema.Message) int {
 	if message == nil {
 		return 0
@@ -2091,4 +2156,16 @@ type codeSearchArguments struct {
 	Query   string `json:"query" jsonschema:"description=Natural-language or partial-symbol query describing the code to locate"`
 	TopK    int    `json:"topK,omitempty" jsonschema:"description=Maximum results from 1 to 20; default 8"`
 	Rebuild bool   `json:"rebuild,omitempty" jsonschema:"description=Force index rebuild; use only after the workspace changed significantly"`
+}
+
+// memorySaveArguments 是 memory_save 工具的入参（paicli-go 迁移能力）。
+type memorySaveArguments struct {
+	Content string `json:"content" jsonschema:"description=Durable fact to remember such as a verified route RPC recipe error signature or target quirk"`
+	Scope   string `json:"scope,omitempty" jsonschema:"description=Memory scope; omit for the current profile or set global for target-independent facts"`
+}
+
+// memorySearchArguments 是 memory_search 工具的入参（paicli-go 迁移能力）。
+type memorySearchArguments struct {
+	Query string `json:"query" jsonschema:"description=Focused keyword or phrase; empty returns the most recent memory entries"`
+	Limit int    `json:"limit,omitempty" jsonschema:"description=Maximum results from 1 to 50; default 8"`
 }

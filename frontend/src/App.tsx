@@ -1,4 +1,6 @@
-import {FormEvent, ReactNode, useEffect, useMemo, useRef, useState} from 'react';
+import {FormEvent, useEffect, useMemo, useRef, useState} from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {EventsOff, EventsOn} from '../wailsjs/runtime/runtime';
 import './App.css';
 
@@ -41,6 +43,7 @@ type DiagnosticRun = {
     conversationId: string;
     profileId: string;
     goal: string;
+    mode: 'agent' | 'team' | 'manual';
     status: string;
     startedAt: string;
 };
@@ -52,6 +55,29 @@ type DiagnosticEvent = {
     type: string;
     timestamp: string;
     payload?: any;
+};
+
+type TeamStep = {
+    id: string;
+    goal: string;
+    role: 'device' | 'platform' | 'source' | 'web' | 'correlator' | string;
+    dependsOn?: string[];
+    sourceSearch?: {
+        exactTerms?: string[];
+        ownerPaths?: string[];
+        maxSearches?: number;
+        runtimeDerived?: boolean;
+    };
+};
+
+type TeamStepResult = {
+    stepId: string;
+    role: string;
+    status: 'success' | 'partial' | 'failed' | 'skipped' | string;
+    summary?: string;
+    evidenceIds?: string[];
+    unknowns?: string[];
+    error?: string;
 };
 
 // 证据 Inspector 里把字符串字面量转义符(\r\n 等)还原成真实字符。
@@ -236,6 +262,7 @@ function App() {
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState('');
     const [mode, setMode] = useState<'agent' | 'manual'>('agent');
+    const [diagnosticMode, setDiagnosticMode] = useState<'agent' | 'team'>('agent');
     const [manualKind, setManualKind] = useState<'nbi' | 'netconf'>('nbi');
     const [manualDraft, setManualDraft] = useState<ManualDraft>(defaultManualDraft);
     const [manualPrompt, setManualPrompt] = useState('');
@@ -420,9 +447,10 @@ function App() {
             setReadiness(currentReadiness);
             if (!currentReadiness.ready) throw new Error(currentReadiness.issues?.join('; ') || 'Agent is not ready');
             // 构造请求：有附件时带上 attachments 字段
-            const payload: {goal: string; profileId: string; attachments?: {filename: string; mimeType: string; data: string}[]} = {
+            const payload: {goal: string; profileId: string; mode: 'agent' | 'team'; attachments?: {filename: string; mimeType: string; data: string}[]} = {
                 goal: submittedGoal,
                 profileId,
+                mode: diagnosticMode,
             };
             if (submittedAttachments.length > 0) {
                 payload.attachments = submittedAttachments.map(a => ({filename: a.filename, mimeType: a.mimeType, data: a.data}));
@@ -688,6 +716,14 @@ function App() {
                     </div>
                     <div className="mode-tabs"><button className={mode === 'agent' ? 'active' : ''} onClick={() => setMode('agent')}>AGENT</button><button className={mode === 'manual' ? 'active' : ''} onClick={() => setMode('manual')}>MANUAL</button></div>
                     {mode === 'agent' ? <>
+                        <div className="diagnostic-mode" aria-label="Diagnostic execution mode">
+                            <button type="button" className={diagnosticMode === 'agent' ? 'active' : ''} disabled={run?.status === 'running'} onClick={() => setDiagnosticMode('agent')}>
+                                <strong>STANDARD</strong><small>single ReAct agent</small>
+                            </button>
+                            <button type="button" className={diagnosticMode === 'team' ? 'active' : ''} disabled={run?.status === 'running'} onClick={() => setDiagnosticMode('team')}>
+                                <strong>DEEP TEAM</strong><small>DAG evidence workers</small>
+                            </button>
+                        </div>
                         <div className="goal-heading">
                             <label className="goal-label" htmlFor="goal">What is failing?</label>
                             <button className={`history-toggle ${showHistory ? 'active' : ''}`} type="button" disabled={busy || !profileId} onClick={() => setShowHistory(current => !current)} aria-expanded={showHistory}>
@@ -779,7 +815,7 @@ function App() {
                                 <p>Select a target, state the symptom, and the agent will build an evidence trail before drawing a conclusion.</p>
                             </div>
                         )}
-                        {events.map(event => <TimelineEvent key={event.id} event={event} onEvidence={setSelectedEvidence}/>)}
+                        <TimelineFeed events={events} onEvidence={setSelectedEvidence}/>
                     </div>
 
                     {approval && run?.status === 'running' && (
@@ -835,23 +871,137 @@ function attachmentsEqual(left: Attachment[], right: Attachment[]) {
     });
 }
 
-function TimelineEvent({event, onEvidence}: {event: DiagnosticEvent; onEvidence: (evidence: Evidence) => void}) {
+function workerStepId(event: DiagnosticEvent): string {
+    const payload = event.payload ?? {};
+    return String(payload.workerStepId ?? payload.metadata?.['team.worker_step_id'] ?? '');
+}
+
+function TimelineFeed({events, onEvidence}: {events: DiagnosticEvent[]; onEvidence: (evidence: Evidence) => void}) {
+    const teamPlanByRun = new Map<string, DiagnosticEvent>();
+    const evidenceByID = new Map<string, Evidence>();
+    for (const event of events) {
+        if (event.type === 'team.planned' && !teamPlanByRun.has(event.runId)) teamPlanByRun.set(event.runId, event);
+        if (event.type === 'evidence.captured' && event.payload?.id) evidenceByID.set(String(event.payload.id), event.payload as Evidence);
+    }
+
+    return <>{events.map(event => {
+        if (event.type === 'team.planned') {
+            const runEvents = events.filter(candidate => candidate.runId === event.runId);
+            return <TeamExecutionBoard key={event.id} planEvent={event} events={runEvents} evidenceByID={evidenceByID} onEvidence={onEvidence}/>;
+        }
+        const isTeamExecutionEvent = event.type.startsWith('team.step.') || workerStepId(event) ||
+            ['tool.proposed', 'tool.started', 'tool.completed', 'tool.failed', 'evidence.captured'].includes(event.type);
+        if (teamPlanByRun.has(event.runId) && isTeamExecutionEvent) return null;
+        return <TimelineEvent key={event.id} event={event} evidenceByID={evidenceByID} onEvidence={onEvidence}/>;
+    })}</>;
+}
+
+function TeamExecutionBoard({planEvent, events, evidenceByID, onEvidence}: {
+    planEvent: DiagnosticEvent;
+    events: DiagnosticEvent[];
+    evidenceByID: Map<string, Evidence>;
+    onEvidence: (evidence: Evidence) => void;
+}) {
+    const steps = (Array.isArray(planEvent.payload?.steps) ? planEvent.payload.steps : []) as TeamStep[];
+    const finishedByStep = new Map<string, DiagnosticEvent>();
+    const startedByStep = new Map<string, DiagnosticEvent>();
+    for (const event of events) {
+        const stepID = String(event.payload?.stepId ?? '');
+        if (event.type === 'team.step.started' && stepID) startedByStep.set(stepID, event);
+        if (event.type === 'team.step.finished' && stepID) finishedByStep.set(stepID, event);
+    }
+    const completed = steps.filter(step => finishedByStep.has(step.id)).length;
+
+    return (
+        <article className="trace-event trace-team-board">
+            <time>{new Date(planEvent.timestamp).toLocaleTimeString([], {hour12: false})}</time>
+            <span className="trace-node"/>
+            <div className="trace-content team-board">
+                <header className="team-board-heading">
+                    <div><small>team.planned</small><strong>Sub-agent steps</strong></div>
+                    <b>{completed}/{steps.length} finished</b>
+                </header>
+                <div className="team-worker-grid">
+                {steps.map((step, index) => {
+                    const started = startedByStep.get(step.id);
+                    const finished = finishedByStep.get(step.id);
+                    const result = finished?.payload as TeamStepResult | undefined;
+                    const status = result?.status ?? (started ? 'running' : 'queued');
+                    const activities = events.filter(event => workerStepId(event) === step.id && ['tool.started', 'tool.failed', 'evidence.captured'].includes(event.type));
+                    const evidenceIDs = Array.from(new Set([
+                        ...(result?.evidenceIds ?? []),
+                        ...activities.filter(event => event.type === 'evidence.captured').map(event => String(event.payload?.id ?? '')).filter(Boolean),
+                    ]));
+                    const elapsed = started && finished ? Math.max(0, new Date(finished.timestamp).getTime() - new Date(started.timestamp).getTime()) : undefined;
+                    return (
+                        <article key={step.id} className={`team-worker-card role-${step.role} worker-${status}`}>
+                            <div className="team-worker-topline">
+                                <span className="worker-index">{String(index + 1).padStart(2, '0')}</span>
+                                <span className="worker-role">{step.role}</span>
+                                <span className={`worker-status ${status}`}>{status}</span>
+                            </div>
+                            <small>SUB AGENT · {step.id}</small>
+                            <h3>{step.goal}</h3>
+                            {(step.dependsOn?.length ?? 0) > 0 && <div className="worker-dependencies"><span>等待上游</span>{step.dependsOn!.map(id => <code key={id}>{id}</code>)}</div>}
+                            <div className="worker-metrics">
+                                <span>{activities.filter(item => item.type === 'tool.started').length} tools</span>
+                                <span>{evidenceIDs.length} evidence</span>
+                                {elapsed !== undefined && <span>{formatDuration(elapsed)}</span>}
+                            </div>
+                            {result?.summary && <details className="worker-result">
+                                <summary>查看交接结果</summary>
+                                <p>{result.summary}</p>
+                            </details>}
+                            {result?.error && <p className="worker-error">{result.error}</p>}
+                            {activities.length > 0 && <details className="worker-activity" open={status === 'running'}>
+                                <summary>查看 {activities.length} 条执行记录</summary>
+                                <div>{activities.map(activity => {
+                                    const isEvidence = activity.type === 'evidence.captured';
+                                    const label = isEvidence ? 'EVIDENCE' : activity.type === 'tool.failed' ? 'FAILED' : 'TOOL';
+                                    const name = activity.payload?.name ?? activity.payload?.kind ?? 'operation';
+                                    const detail = activity.payload?.summary ?? activity.payload?.error ?? '';
+                                    return <button key={activity.id} type="button" className={isEvidence ? 'worker-activity-row evidence' : 'worker-activity-row'} disabled={!isEvidence} onClick={() => isEvidence && onEvidence(activity.payload as Evidence)}>
+                                        <b>{label}</b><span><strong>{String(name).replaceAll('_', ' ')}</strong><small>{detail}</small></span>
+                                    </button>;
+                                })}</div>
+                            </details>}
+                            {evidenceIDs.length > 0 && <div className="worker-evidence-links">{evidenceIDs.map(id => {
+                                const evidence = evidenceByID.get(id);
+                                return <button key={id} type="button" disabled={!evidence} title={id} onClick={() => evidence && onEvidence(evidence)}>{id.slice(0, 8)}</button>;
+                            })}</div>}
+                        </article>
+                    );
+                })}
+                </div>
+            </div>
+        </article>
+    );
+}
+
+function formatDuration(milliseconds: number): string {
+    if (milliseconds < 1000) return `${milliseconds} ms`;
+    return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 1 : 0)} s`;
+}
+
+function TimelineEvent({event, evidenceByID, onEvidence}: {event: DiagnosticEvent; evidenceByID: Map<string, Evidence>; onEvidence: (evidence: Evidence) => void}) {
     const payload = event.payload ?? {};
     const isEvidence = event.type === 'evidence.captured';
     const title: Record<string, string> = {
         'run.started': 'User request', 'agent.message': 'Agent analysis', 'tool.proposed': 'Tool proposed',
         'approval.required': 'Waiting for approval', 'approval.resolved': 'Approval resolved', 'tool.started': 'Tool executing', 'evidence.captured': 'Evidence captured',
-        'tool.completed': 'Tool completed', 'tool.failed': 'Tool failed', 'run.completed': 'Diagnosis complete', 'run.failed': 'Run failed', 'run.cancelled': 'Run cancelled',
+        'tool.completed': 'Tool completed', 'tool.failed': 'Tool failed', 'team.planned': 'Team plan ready',
+        'team.step.started': 'Evidence worker started', 'team.step.finished': 'Evidence worker finished',
+        'run.completed': 'Diagnosis complete', 'run.failed': 'Run failed', 'run.cancelled': 'Run cancelled',
     };
     const detail = event.type === 'agent.message' ? payload.content : event.type === 'run.started' ? payload.goal : event.type === 'approval.resolved'
         ? payload.automatic ? 'Automatically approved for this conversation' : payload.scope === 'conversation' ? 'Approved; later requests in this conversation will run automatically' : payload.approved ? 'Approved once' : 'Denied'
         : payload.summary || payload.error || payload.name || '';
-    const expandable = ['tool.proposed', 'tool.failed', 'approval.required', 'run.failed'].includes(event.type);
+    const expandable = ['tool.proposed', 'tool.failed', 'approval.required', 'team.planned', 'team.step.finished', 'run.failed'].includes(event.type);
     return (
         <article className={`trace-event trace-${event.type.replace('.', '-')}`} onClick={() => isEvidence && onEvidence(payload as Evidence)}>
             <time>{new Date(event.timestamp).toLocaleTimeString([], {hour12: false})}</time>
             <span className="trace-node"/>
-            <div className="trace-content"><small>{event.type}</small><strong>{title[event.type] ?? event.type}</strong>{detail && (event.type === 'agent.message' ? <MarkdownMessage content={String(detail)}/> : <p>{detail}</p>)}{isEvidence && <button>Inspect raw evidence</button>}{expandable && <details className="trace-details"><summary>Show details</summary><pre>{JSON.stringify(payload, null, 2)}</pre></details>}</div>
+            <div className="trace-content"><small>{event.type}</small><strong>{title[event.type] ?? event.type}</strong>{detail && (event.type === 'agent.message' ? <MarkdownMessage content={String(detail)} evidenceByID={evidenceByID} onEvidence={onEvidence}/> : <p>{detail}</p>)}{isEvidence && <button>Inspect raw evidence</button>}{expandable && <details className="trace-details"><summary>Show details</summary><pre>{JSON.stringify(payload, null, 2)}</pre></details>}</div>
         </article>
     );
 }
@@ -877,174 +1027,35 @@ function TimelineEventLegacy({event, onEvidence}: {event: DiagnosticEvent; onEvi
     );
 }
 
-function MarkdownMessage({content}: {content: string}) {
-    return <div className="markdown-message">{parseMarkdownBlocks(content)}</div>;
+function MarkdownMessage({content, evidenceByID, onEvidence}: {content: string; evidenceByID: Map<string, Evidence>; onEvidence: (evidence: Evidence) => void}) {
+    return <div className="markdown-message">
+        <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+                a: ({node: _node, ...props}) => <a {...props} target="_blank" rel="noreferrer"/>,
+                code: ({node: _node, children, ...props}) => {
+                    const reference = resolveEvidenceReference(String(children), evidenceByID);
+                    return reference
+                        ? <button type="button" className="evidence-reference" title={`Inspect evidence ${reference.id}`} onClick={event => {
+                            event.stopPropagation();
+                            onEvidence(reference);
+                        }}>{children}</button>
+                        : <code {...props}>{children}</code>;
+                },
+                table: ({node: _node, ...props}) => <div className="markdown-table-wrap"><table className="markdown-table" {...props}/></div>,
+            }}
+        >{content}</ReactMarkdown>
+    </div>;
 }
 
-function parseMarkdownBlocks(markdown: string): ReactNode[] {
-    const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
-    const blocks: ReactNode[] = [];
-    let index = 0;
-
-    while (index < lines.length) {
-        const line = lines[index];
-        if (!line.trim()) {
-            index++;
-            continue;
-        }
-
-        if (line.trim().startsWith('```')) {
-            const language = line.trim().slice(3).trim();
-            const code: string[] = [];
-            index++;
-            while (index < lines.length && !lines[index].trim().startsWith('```')) {
-                code.push(lines[index]);
-                index++;
-            }
-            if (index < lines.length) index++;
-            blocks.push(<pre className="markdown-code" key={`code-${blocks.length}`}><code data-language={language || undefined}>{code.join('\n')}</code></pre>);
-            continue;
-        }
-
-        if (isTableStart(lines, index)) {
-            const headers = splitTableCells(lines[index]);
-            index += 2;
-            const rows: string[][] = [];
-            while (index < lines.length && isTableRow(lines[index])) {
-                rows.push(splitTableCells(lines[index]));
-                index++;
-            }
-            blocks.push(
-                <div className="markdown-table-wrap" key={`table-${blocks.length}`}>
-                    <table className="markdown-table">
-                        <thead><tr>{headers.map((cell, cellIndex) => <th key={cellIndex}>{renderInline(cell)}</th>)}</tr></thead>
-                        <tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}>{headers.map((_, cellIndex) => <td key={cellIndex}>{renderInline(row[cellIndex] ?? '')}</td>)}</tr>)}</tbody>
-                    </table>
-                </div>,
-            );
-            continue;
-        }
-
-        const heading = line.match(/^(#{1,6})\s+(.+)$/);
-        if (heading) {
-            const headingContent = renderInline(heading[2]);
-            const key = `heading-${blocks.length}`;
-            switch (heading[1].length) {
-                case 1: blocks.push(<h1 key={key}>{headingContent}</h1>); break;
-                case 2: blocks.push(<h2 key={key}>{headingContent}</h2>); break;
-                case 3: blocks.push(<h3 key={key}>{headingContent}</h3>); break;
-                case 4: blocks.push(<h4 key={key}>{headingContent}</h4>); break;
-                case 5: blocks.push(<h5 key={key}>{headingContent}</h5>); break;
-                default: blocks.push(<h6 key={key}>{headingContent}</h6>); break;
-            }
-            index++;
-            continue;
-        }
-
-        if (/^\s*[-*]\s+/.test(line)) {
-            const items: string[] = [];
-            while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
-                items.push(lines[index].replace(/^\s*[-*]\s+/, ''));
-                index++;
-            }
-            blocks.push(<ul key={`list-${blocks.length}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderInline(item)}</li>)}</ul>);
-            continue;
-        }
-
-        if (/^\s*\d+[.)]\s+/.test(line)) {
-            const items: string[] = [];
-            while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index])) {
-                items.push(lines[index].replace(/^\s*\d+[.)]\s+/, ''));
-                index++;
-            }
-            blocks.push(<ol key={`ordered-${blocks.length}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderInline(item)}</li>)}</ol>);
-            continue;
-        }
-
-        if (/^\s*>\s?/.test(line)) {
-            const quote: string[] = [];
-            while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
-                quote.push(lines[index].replace(/^\s*>\s?/, ''));
-                index++;
-            }
-            blocks.push(<blockquote key={`quote-${blocks.length}`}>{renderInlineWithBreaks(quote.join('\n'))}</blockquote>);
-            continue;
-        }
-
-        const paragraph: string[] = [line];
-        index++;
-        while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines, index)) {
-            paragraph.push(lines[index]);
-            index++;
-        }
-        blocks.push(<p key={`paragraph-${blocks.length}`}>{renderInlineWithBreaks(paragraph.join('\n'))}</p>);
-    }
-
-    return blocks;
-}
-
-function isMarkdownBlockStart(lines: string[], index: number): boolean {
-    return lines[index].trim().startsWith('```') || isTableStart(lines, index) || /^(#{1,6})\s+/.test(lines[index]) || /^\s*[-*]\s+/.test(lines[index]) || /^\s*\d+[.)]\s+/.test(lines[index]) || /^\s*>\s?/.test(lines[index]);
-}
-
-function isTableStart(lines: string[], index: number): boolean {
-    return index + 1 < lines.length && isTableRow(lines[index]) && isTableSeparator(lines[index + 1]);
-}
-
-function isTableRow(line: string): boolean {
-    return line.includes('|') && splitTableCells(line).length > 0;
-}
-
-function isTableSeparator(line: string): boolean {
-    const cells = splitTableCells(line);
-    return cells.length > 0 && cells.every(cell => /^\s*:?-{3,}:?\s*$/.test(cell));
-}
-
-function splitTableCells(line: string): string[] {
-    let value = line.trim();
-    if (value.startsWith('|')) value = value.slice(1);
-    if (value.endsWith('|') && !value.endsWith('\\|')) value = value.slice(0, -1);
-    const cells: string[] = [];
-    let current = '';
-    let escaped = false;
-    for (const character of value) {
-        if (escaped) {
-            current += character;
-            escaped = false;
-        } else if (character === '\\') {
-            escaped = true;
-        } else if (character === '|') {
-            cells.push(current.trim());
-            current = '';
-        } else {
-            current += character;
-        }
-    }
-    if (escaped) current += '\\';
-    cells.push(current.trim());
-    return cells;
-}
-
-function renderInlineWithBreaks(value: string): ReactNode[] {
-    return value.split('\n').flatMap((line, index, lines) => index < lines.length - 1 ? [renderInline(line), <br key={`br-${index}`}/>] : [renderInline(line)]);
-}
-
-function renderInline(value: string): ReactNode[] {
-    const tokens = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\))/g;
-    const output: ReactNode[] = [];
-    let cursor = 0;
-    let match: RegExpExecArray | null;
-    while ((match = tokens.exec(value)) !== null) {
-        if (match.index > cursor) output.push(value.slice(cursor, match.index));
-        const token = match[0];
-        if (token.startsWith('`')) output.push(<code key={`inline-code-${match.index}`}>{token.slice(1, -1)}</code>);
-        else if (token.startsWith('**') || token.startsWith('__')) output.push(<strong key={`strong-${match.index}`}>{token.slice(2, -2)}</strong>);
-        else if (token.startsWith('*') || token.startsWith('_')) output.push(<em key={`em-${match.index}`}>{token.slice(1, -1)}</em>);
-        else if (match[2] && match[3]) output.push(<a key={`link-${match.index}`} href={match[3]} target="_blank" rel="noreferrer">{match[2]}</a>);
-        cursor = match.index + token.length;
-    }
-    if (cursor < value.length) output.push(value.slice(cursor));
-    return output;
+function resolveEvidenceReference(value: string, evidenceByID: Map<string, Evidence>): Evidence | undefined {
+    if (value.includes('\n')) return undefined;
+    const reference = value.trim();
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f-]{27,})?$/i.test(reference)) return undefined;
+    const exact = evidenceByID.get(reference);
+    if (exact) return exact;
+    const matches = Array.from(evidenceByID.entries()).filter(([id]) => id.toLowerCase().startsWith(reference.toLowerCase()));
+    return matches.length === 1 ? matches[0][1] : undefined;
 }
 
 type NETCONFEndpointForm = NETCONFEndpoint & {password?: string};

@@ -2,11 +2,15 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
 	"olt-diagnostic-agent/internal/domain"
@@ -312,5 +316,415 @@ func TestRetainModelMessagesOmitsRegeneratedSystemContent(t *testing.T) {
 		if message.Role == schema.System {
 			t.Fatal("checkpoint must not retain regenerated system messages")
 		}
+	}
+}
+
+type contextSummaryModelMock struct {
+	response *schema.Message
+	err      error
+}
+
+var _ model.BaseModel[*schema.Message] = (*contextSummaryModelMock)(nil)
+
+func (m *contextSummaryModelMock) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	return m.response, m.err
+}
+
+func (m *contextSummaryModelMock) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, m.err
+}
+
+func validDiagnosticSummaryJSON() string {
+	return `{"goal":"检查 ONU 状态","target":"onu-1","confirmed_facts":["在线"],"observed_errors":[],"rejected_hypotheses":[],"completed_checks":["ping"],"open_questions":[],"next_action":"继续检查","do_not_repeat":[]}`
+}
+
+func TestValidateDiagnosticSummaryStrictJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		valid   bool
+	}{
+		{name: "合法", content: validDiagnosticSummaryJSON(), valid: true},
+		{name: "缺字段", content: `{"goal":"g","target":"t","confirmed_facts":[],"observed_errors":[],"rejected_hypotheses":[],"completed_checks":[],"open_questions":[],"next_action":"a"}`},
+		{name: "未知字段", content: `{"goal":"g","target":"t","confirmed_facts":[],"observed_errors":[],"rejected_hypotheses":[],"completed_checks":[],"open_questions":[],"next_action":"a","do_not_repeat":[],"extra":"nope"}`},
+		{name: "尾随 JSON", content: validDiagnosticSummaryJSON() + ` {}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := validateDiagnosticSummary(test.content)
+			if test.valid {
+				if err != nil || got == "" {
+					t.Fatalf("expected valid summary, got %q, %v", got, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected summary validation failure, got %q", got)
+			}
+		})
+	}
+}
+
+func TestContextManagerSummaryModelFailurePreservesStateAndCallsOnFailure(t *testing.T) {
+	state := &adk.ChatModelAgentState{Messages: []*schema.Message{schema.UserMessage("原始消息")}}
+	modelErr := errors.New("summary model failed")
+	failureCalled := false
+	manager := &contextManager{
+		model: &contextSummaryModelMock{err: modelErr}, memory: func() (*schema.Message, error) { return nil, nil },
+		onFailure: func(err error) { failureCalled = errors.Is(err, modelErr) }, triggerMessages: 1, minNewMessages: 1,
+	}
+	_, got, err := manager.BeforeModelRewriteState(context.Background(), state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != state || len(got.Messages) != 1 || got.Messages[0].Content != "原始消息" {
+		t.Fatalf("state was not returned unchanged: got=%+v", got)
+	}
+	if !failureCalled {
+		t.Fatal("expected onFailure to be called with model error")
+	}
+}
+
+func TestContextManagerValidSummaryIncludesSummaryAndRecentMessages(t *testing.T) {
+	state := &adk.ChatModelAgentState{Messages: []*schema.Message{schema.UserMessage("用户请求"), {Role: schema.Assistant, Content: "最近证据"}}}
+	manager := &contextManager{
+		model: &contextSummaryModelMock{response: schema.AssistantMessage(validDiagnosticSummaryJSON(), nil)}, memory: func() (*schema.Message, error) { return nil, nil },
+		triggerMessages: 1, minNewMessages: 1,
+	}
+	_, got, err := manager.BeforeModelRewriteState(context.Background(), state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 3 {
+		t.Fatalf("expected summary plus two recent messages, got %d", len(got.Messages))
+	}
+	if !strings.Contains(got.Messages[0].Content, `"goal":"检查 ONU 状态"`) || !strings.Contains(got.Messages[2].Content, "最近证据") {
+		t.Fatalf("unexpected compacted message layout: %+v", got.Messages)
+	}
+}
+
+func TestTeamPassesDependencyResultsToDownstreamWorker(t *testing.T) {
+	team := Team{
+		Planner: FuncPlanner(func(context.Context, string) ([]TeamStep, error) {
+			return []TeamStep{
+				{ID: "device", Goal: "read device state", Role: "device"},
+				{ID: "correlate", Goal: "correlate evidence", Role: "correlator", DependsOn: []string{"device"}},
+			}, nil
+		}),
+		Worker: FuncWorker(func(_ context.Context, input TeamWorkInput) (TeamStepResult, error) {
+			if input.Step.ID == "device" {
+				return TeamStepResult{Status: teamStepSuccess, Summary: "ONU is up", EvidenceIDs: []string{"ev-1"}}, nil
+			}
+			dependency, ok := input.Dependencies["device"]
+			if !ok || dependency.Summary != "ONU is up" || len(dependency.EvidenceIDs) != 1 || dependency.EvidenceIDs[0] != "ev-1" {
+				t.Fatalf("downstream worker received wrong dependencies: %+v", input.Dependencies)
+			}
+			return TeamStepResult{Status: teamStepSuccess, Summary: "correlated"}, nil
+		}),
+		Reviewer: FuncReviewer(func(_ context.Context, _ string, outputs map[string]TeamStepResult) (string, error) {
+			if outputs["device"].Status != teamStepSuccess || outputs["correlate"].Status != teamStepSuccess {
+				t.Fatalf("reviewer received incomplete outputs: %+v", outputs)
+			}
+			return "done", nil
+		}),
+		MaxParallel: 4,
+	}
+
+	result, err := team.Run(context.Background(), "diagnose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Answer != "done" {
+		t.Fatalf("answer = %q, want done", result.Answer)
+	}
+}
+
+func TestTeamSkipsDownstreamStepAfterDependencyFailure(t *testing.T) {
+	downstreamCalled := false
+	team := Team{
+		Planner: FuncPlanner(func(context.Context, string) ([]TeamStep, error) {
+			return []TeamStep{
+				{ID: "device", Goal: "read device state", Role: "device"},
+				{ID: "correlate", Goal: "correlate evidence", Role: "correlator", DependsOn: []string{"device"}},
+			}, nil
+		}),
+		Worker: FuncWorker(func(_ context.Context, input TeamWorkInput) (TeamStepResult, error) {
+			if input.Step.ID == "device" {
+				return TeamStepResult{Summary: "device unreachable"}, errors.New("timeout")
+			}
+			downstreamCalled = true
+			return TeamStepResult{Status: teamStepSuccess, Summary: "unexpected"}, nil
+		}),
+		Reviewer: FuncReviewer(func(_ context.Context, _ string, outputs map[string]TeamStepResult) (string, error) {
+			if outputs["device"].Status != teamStepFailed {
+				t.Fatalf("failed dependency not preserved: %+v", outputs["device"])
+			}
+			if outputs["correlate"].Status != teamStepSkipped || outputs["correlate"].SkipFrom != "device" {
+				t.Fatalf("downstream skip not preserved: %+v", outputs["correlate"])
+			}
+			return "partial conclusion", nil
+		}),
+	}
+
+	if _, err := team.Run(context.Background(), "diagnose"); err != nil {
+		t.Fatal(err)
+	}
+	if downstreamCalled {
+		t.Fatal("downstream worker ran after its dependency failed")
+	}
+}
+
+func TestParseTeamStepsRejectsModelGrantedRole(t *testing.T) {
+	_, err := parseTeamSteps(`[{"id":"unsafe","goal":"change device state","role":"writer"}]`)
+	if err == nil || !strings.Contains(err.Error(), "unsupported role") {
+		t.Fatalf("expected unsupported role error, got %v", err)
+	}
+}
+
+func TestWireTeamLocatorDependenciesOrdersDeviceWorkAfterPlatformLookup(t *testing.T) {
+	steps := wireTeamLocatorDependencies("ALCLFE2F75E8 这个 ONT 为什么没上线", []TeamStep{
+		{ID: "ont_state", Goal: "read live ONT state", Role: "device"},
+		{ID: "source_def", Goal: "find field definitions", Role: "source"},
+		{ID: "platform_locator", Goal: "resolve serial to LT and PON", Role: "platform"},
+		{ID: "optical", Goal: "read optical state", Role: "device"},
+	})
+	for _, step := range steps {
+		if step.Role == "device" && (len(step.DependsOn) != 1 || step.DependsOn[0] != "platform_locator") {
+			t.Fatalf("device step %s was not wired behind locator: %+v", step.ID, step.DependsOn)
+		}
+		if step.Role == "source" && len(step.DependsOn) != 0 {
+			t.Fatalf("independent source step was serialized: %+v", step.DependsOn)
+		}
+	}
+}
+
+func TestWireTeamLocatorDependenciesKeepsKnownLTParallel(t *testing.T) {
+	steps := wireTeamLocatorDependencies("检查 lt2 上的 ALCLFE2F75E8", []TeamStep{
+		{ID: "device", Goal: "read live state", Role: "device"},
+		{ID: "platform", Goal: "read platform config", Role: "platform"},
+	})
+	if len(steps[0].DependsOn) != 0 {
+		t.Fatalf("known locator should not create an artificial dependency: %+v", steps[0].DependsOn)
+	}
+}
+
+func TestParseTeamStepsNormalizesBoundedSourceSearchBrief(t *testing.T) {
+	steps, err := parseTeamSteps(`[{
+		"id":"source_def",
+		"goal":"explain the observed notActivated state",
+		"role":"source",
+		"sourceSearch":{
+			"exactTerms":[" notActivated ","notActivated"],
+			"ownerPaths":["server\\internal\\routers\\nbi"],
+			"maxSearches":99,
+			"runtimeDerived":true
+		}
+	}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	search := steps[0].SourceSearch
+	if search == nil {
+		t.Fatal("source search brief was not created")
+	}
+	if len(search.ExactTerms) != 1 || search.ExactTerms[0] != "notActivated" {
+		t.Fatalf("exact terms were not normalized: %+v", search.ExactTerms)
+	}
+	if len(search.OwnerPaths) != 1 || search.OwnerPaths[0] != "server/internal/routers/nbi" {
+		t.Fatalf("owner paths were not normalized: %+v", search.OwnerPaths)
+	}
+	if search.MaxSearches != teamSourceMaxSearch || !search.RuntimeDerived {
+		t.Fatalf("source search bounds were not enforced: %+v", search)
+	}
+}
+
+func TestParseTeamStepsRejectsSourceSearchPathTraversal(t *testing.T) {
+	_, err := parseTeamSteps(`[{
+		"id":"source_def",
+		"goal":"read a definition",
+		"role":"source",
+		"sourceSearch":{"ownerPaths":["../outside"],"maxSearches":1}
+	}]`)
+	if err == nil || !strings.Contains(err.Error(), "workspace-relative") {
+		t.Fatalf("expected unsafe owner path to be rejected, got %v", err)
+	}
+}
+
+func TestWireTeamSourceDependenciesUsesLivePlatformResult(t *testing.T) {
+	steps := wireTeamSourceDependencies([]TeamStep{
+		{ID: "source_def", Goal: "explain returned status", Role: "source", SourceSearch: &TeamSourceSearch{RuntimeDerived: true, MaxSearches: 2}},
+		{ID: "platform_state", Goal: "read platform state", Role: "platform"},
+		{ID: "device_state", Goal: "read device state", Role: "device", DependsOn: []string{"platform_state"}},
+	})
+	if len(steps[0].DependsOn) != 1 || steps[0].DependsOn[0] != "platform_state" {
+		t.Fatalf("runtime-derived source step did not wait for platform evidence: %+v", steps[0].DependsOn)
+	}
+}
+
+func TestWireTeamSourceDependenciesDoesNotCreateCycle(t *testing.T) {
+	steps := wireTeamSourceDependencies([]TeamStep{
+		{ID: "source_def", Goal: "explain returned status", Role: "source", SourceSearch: &TeamSourceSearch{RuntimeDerived: true, MaxSearches: 2}},
+		{ID: "platform_state", Goal: "read platform state", Role: "platform", DependsOn: []string{"source_def"}},
+	})
+	if len(steps[0].DependsOn) != 0 {
+		t.Fatalf("source dependency wiring introduced a cycle: %+v", steps[0].DependsOn)
+	}
+}
+
+func TestBuildTeamWorkerResultAcceptsNaturalLanguageAndHostEvidence(t *testing.T) {
+	result, err := buildTeamWorkerResult(
+		"Observed: ONT is discovered but not activated [ev-platform].",
+		[]string{"ev-platform", "ev-device", "ev-platform"},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != teamStepSuccess {
+		t.Fatalf("status = %q, want %q", result.Status, teamStepSuccess)
+	}
+	if result.Summary != "Observed: ONT is discovered but not activated [ev-platform]." {
+		t.Fatalf("unexpected summary: %q", result.Summary)
+	}
+	if len(result.EvidenceIDs) != 2 || result.EvidenceIDs[0] != "ev-platform" || result.EvidenceIDs[1] != "ev-device" {
+		t.Fatalf("host evidence IDs were not preserved and deduplicated: %+v", result.EvidenceIDs)
+	}
+}
+
+func TestBuildTeamWorkerResultPreservesEvidenceAtIterationLimit(t *testing.T) {
+	limitErr := errors.New("[NodeRunError] pre processor fail: exceeds max iterations")
+	result, err := buildTeamWorkerResult(
+		"",
+		[]string{"ev-1"},
+		[]string{`{"evidenceId":"ev-1","summary":"NBI returned HTTP 200","data":{"status":"discovered"}}`},
+		nil,
+		limitErr,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != teamStepPartial || len(result.EvidenceIDs) != 1 {
+		t.Fatalf("bounded partial result did not preserve evidence: %+v", result)
+	}
+	if !strings.Contains(result.Summary, "status") || !strings.Contains(result.Error, "max iterations") {
+		t.Fatalf("partial result lost its evidence snapshot or stop reason: %+v", result)
+	}
+}
+
+func TestBuildTeamWorkerResultFailsWithoutReportOrEvidence(t *testing.T) {
+	_, err := buildTeamWorkerResult("", nil, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "without evidence") {
+		t.Fatalf("expected empty worker result to fail, got %v", err)
+	}
+}
+
+func TestTeamToolBudgetEnforcesLimitAcrossConcurrentCalls(t *testing.T) {
+	budget := &teamToolBudget{limit: 8}
+	results := make(chan bool, 64)
+	var workers sync.WaitGroup
+	for index := 0; index < cap(results); index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			results <- budget.reserve()
+		}()
+	}
+	workers.Wait()
+	close(results)
+	accepted := 0
+	for result := range results {
+		if result {
+			accepted++
+		}
+	}
+	if accepted != 8 || budget.used.Load() != 8 {
+		t.Fatalf("accepted=%d used=%d, want exactly 8", accepted, budget.used.Load())
+	}
+}
+
+func TestTeamToolBudgetCapsSourceSearchesSeparatelyFromReads(t *testing.T) {
+	budget := &teamToolBudget{limit: 10, searchLimit: 4}
+	results := make(chan bool, 32)
+	var workers sync.WaitGroup
+	for index := 0; index < cap(results); index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			accepted, _ := budget.reserveTool("search_code")
+			results <- accepted
+		}()
+	}
+	workers.Wait()
+	close(results)
+	acceptedSearches := 0
+	for accepted := range results {
+		if accepted {
+			acceptedSearches++
+		}
+	}
+	if acceptedSearches != 4 || budget.searchUsed.Load() != 4 {
+		t.Fatalf("accepted searches=%d used=%d, want exactly 4", acceptedSearches, budget.searchUsed.Load())
+	}
+	acceptedReads := 0
+	for index := 0; index < 7; index++ {
+		if accepted, _ := budget.reserveTool("read_file"); accepted {
+			acceptedReads++
+		}
+	}
+	if acceptedReads != 6 || budget.used.Load() != 10 {
+		t.Fatalf("accepted reads=%d total used=%d, want 6 reads and 10 total calls", acceptedReads, budget.used.Load())
+	}
+}
+
+func TestConstrainTeamSourceToolInputBoundsResultFanoutAndDisablesRebuild(t *testing.T) {
+	codeInput := &compose.ToolInput{Name: "search_code", Arguments: `{"query":"ONU activation","topK":20,"rebuild":true}`}
+	constrainTeamSourceToolInput(codeInput)
+	var codeArguments codeSearchArguments
+	if err := json.Unmarshal([]byte(codeInput.Arguments), &codeArguments); err != nil {
+		t.Fatal(err)
+	}
+	if codeArguments.TopK != 8 || codeArguments.Rebuild {
+		t.Fatalf("semantic search was not bounded: %+v", codeArguments)
+	}
+
+	fileInput := &compose.ToolInput{Name: "search_files", Arguments: `{"query":"notActivated","maxResults":500}`}
+	constrainTeamSourceToolInput(fileInput)
+	var fileArguments fileSearchArguments
+	if err := json.Unmarshal([]byte(fileInput.Arguments), &fileArguments); err != nil {
+		t.Fatal(err)
+	}
+	if fileArguments.MaxResults != 50 {
+		t.Fatalf("exact search result fanout = %d, want 50", fileArguments.MaxResults)
+	}
+}
+
+func TestNormalizeDiagnosticModeDefaultsToAgent(t *testing.T) {
+	mode, err := domain.NormalizeDiagnosticMode("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != domain.DiagnosticModeAgent {
+		t.Fatalf("mode = %q, want %q", mode, domain.DiagnosticModeAgent)
+	}
+}
+
+func TestScheduleDAGConvertsWorkerPanicToFailureAndSkipsDependent(t *testing.T) {
+	results, err := ScheduleDAG(context.Background(), []DAGStep{
+		{ID: "panic_step", Work: func(context.Context) error { panic("boom") }},
+		{ID: "dependent", DependsOn: []string{"panic_step"}, Work: func(context.Context) error {
+			t.Fatal("dependent step should not run")
+			return nil
+		}},
+	}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results["panic_step"].Err == nil || !strings.Contains(results["panic_step"].Err.Error(), "panicked") {
+		t.Fatalf("panic was not converted to a step failure: %+v", results["panic_step"])
+	}
+	if !results["dependent"].Skipped || results["dependent"].SkipFrom != "panic_step" {
+		t.Fatalf("dependent step was not skipped: %+v", results["dependent"])
 	}
 }

@@ -385,7 +385,7 @@ var (
 	webMainRE       = regexp.MustCompile(`(?is)<main[^>]*>(.*?)</main>`)
 	webRoleMainRE   = regexp.MustCompile(`(?is)<(?:div|section)[^>]+role\s*=\s*["']main["'][^>]*>(.*?)</(?:div|section)>`)
 	webContentDivRE = regexp.MustCompile(`(?is)<div[^>]+(?:id|class)\s*=\s*["'](?:content|main|article|post|entry-content|article-content|articleBody)["'][^>]*>(.*?)</div>`)
-	webBlockRE      = regexp.MustCompile(`(?is)<(p|div|section|article|li|blockquote|h[1-6])(\s[^>]*)?>(.*?)</\1>`)
+	webBlockRE      = regexp.MustCompile(`(?is)<(p|div|section|article|li|blockquote|h[1-6])(\s[^>]*)?>(.*?)</(?:p|div|section|article|li|blockquote|h[1-6])>`)
 	webAnchorRE     = regexp.MustCompile(`(?is)<a[^>]*>(.*?)</a>`)
 )
 

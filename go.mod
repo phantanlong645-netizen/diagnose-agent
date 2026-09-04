@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/cloudwego/eino v0.9.13
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
+	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/google/uuid v1.6.0
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/wailsapp/wails/v2 v2.13.0
@@ -23,7 +24,6 @@ require (
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/cloudwego/eino-ext/libs/acl/openai v0.1.17 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/eino-contrib/jsonschema v1.0.3 // indirect
 	github.com/evanphx/json-patch v0.5.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect

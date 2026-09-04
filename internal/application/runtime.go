@@ -19,10 +19,14 @@ import (
 	"olt-diagnostic-agent/internal/domain"
 )
 
+// Journal 是诊断数据的 SQLite 持久化实现，满足 Runner 的 RunJournal 接口。
 type Journal struct {
 	db *sql.DB
 }
 
+// initialConversationSchema 是迁移 1 建表语句：会话、运行、事件与会话上下文
+// 四张核心表。one_active_conversation_per_profile 唯一索引保证每个目标档案
+// 同时只有一个 active 会话。
 const initialConversationSchema = `
 CREATE TABLE conversations (
     id TEXT PRIMARY KEY,
@@ -67,6 +71,8 @@ CREATE TABLE conversation_contexts (
     updated_at TEXT NOT NULL
 );`
 
+// contextMemorySchema 是迁移 2 建表语句：上下文事实（可按键替换的持久记忆）、
+// 诊断计划与工具指纹，用于跨 run 的记忆保留与只读结果复用。
 const contextMemorySchema = `
 CREATE TABLE context_facts (
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -105,6 +111,28 @@ CREATE TABLE tool_fingerprints (
 CREATE INDEX tool_fingerprints_by_conversation
     ON tool_fingerprints(conversation_id, last_seen DESC);`
 
+// tokenUsageSchema 是迁移 3 建表语句：按 run/会话记录每次模型生成的
+// token 消耗与耗时。
+const tokenUsageSchema = `
+CREATE TABLE token_usage (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    iteration INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    total_tokens INTEGER NOT NULL,
+    elapsed_ms INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX token_usage_by_conversation
+    ON token_usage(conversation_id, iteration);`
+
+// runModeSchema 是迁移 4 语句：为 runs 表补充诊断模式列（agent/team/manual）。
+const runModeSchema = `ALTER TABLE runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'agent';`
+
+// NewJournal 打开（必要时创建）诊断数据库，配置 WAL 与忙等待超时，
+// 执行 schema 迁移，并恢复上次中断的 run。
 func NewJournal(path string) (*Journal, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, fmt.Errorf("create diagnostics database directory: %w", err)
@@ -143,10 +171,13 @@ func NewJournal(path string) (*Journal, error) {
 	return journal, nil
 }
 
+// Close 关闭底层数据库连接。
 func (j *Journal) Close() error {
 	return j.db.Close()
 }
 
+// migrate 从 schema_migrations 记录的当前版本逐步升级到版本 4：
+// 每个版本在一个事务内应用对应 schema 并登记版本号。
 func (j *Journal) migrate() error {
 	if _, err := j.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
@@ -158,8 +189,8 @@ func (j *Journal) migrate() error {
 	if err := j.db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&version); err != nil {
 		return fmt.Errorf("read diagnostics database version: %w", err)
 	}
-	if version > 2 {
-		return fmt.Errorf("diagnostics database schema version %d is newer than supported version 2", version)
+	if version > 4 {
+		return fmt.Errorf("diagnostics database schema version %d is newer than supported version 4", version)
 	}
 	if version == 0 {
 		tx, err := j.db.Begin()
@@ -195,12 +226,50 @@ func (j *Journal) migrate() error {
 		if err = tx.Commit(); err != nil {
 			return fmt.Errorf("commit diagnostics database migration 2: %w", err)
 		}
+		version = 2
+	}
+	if version == 2 {
+		tx, err := j.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin diagnostics database migration 3: %w", err)
+		}
+		if _, err = tx.Exec(tokenUsageSchema); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("apply diagnostics database migration 3: %w", err)
+		}
+		if _, err = tx.Exec("INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?)", databaseTime(time.Now().UTC())); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record diagnostics database migration 3: %w", err)
+		}
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit diagnostics database migration 3: %w", err)
+		}
+		version = 3
+	}
+	if version == 3 {
+		tx, err := j.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin diagnostics database migration 4: %w", err)
+		}
+		if _, err = tx.Exec(runModeSchema); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("apply diagnostics database migration 4: %w", err)
+		}
+		if _, err = tx.Exec("INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?)", databaseTime(time.Now().UTC())); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record diagnostics database migration 4: %w", err)
+		}
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit diagnostics database migration 4: %w", err)
+		}
 	}
 	return nil
 }
 
+// recoverInterruptedRuns 将上次进程退出时仍处于 running 的 run 标记为失败，
+// 并为缺少上下文快照的会话注入一条"已恢复"的用户消息，避免对话丢失。
 func (j *Journal) recoverInterruptedRuns() error {
-	rows, err := j.db.Query(`SELECT id, conversation_id, profile_id, goal, started_at
+	rows, err := j.db.Query(`SELECT id, conversation_id, profile_id, goal, mode, started_at
         FROM runs WHERE status = 'running' ORDER BY started_at`)
 	if err != nil {
 		return fmt.Errorf("read interrupted diagnostic runs: %w", err)
@@ -209,7 +278,7 @@ func (j *Journal) recoverInterruptedRuns() error {
 	for rows.Next() {
 		var run domain.Run
 		var startedAt string
-		if err = rows.Scan(&run.ID, &run.ConversationID, &run.ProfileID, &run.Goal, &startedAt); err != nil {
+		if err = rows.Scan(&run.ID, &run.ConversationID, &run.ProfileID, &run.Goal, &run.Mode, &startedAt); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("scan interrupted diagnostic run: %w", err)
 		}
@@ -273,6 +342,7 @@ func (j *Journal) recoverInterruptedRuns() error {
 	return nil
 }
 
+// CurrentConversation 返回指定档案当前 active 的会话；若不存在则新建。
 func (j *Journal) CurrentConversation(profileID string) (domain.Conversation, error) {
 	conversation, err := scanConversation(j.db.QueryRow(`SELECT id, profile_id, title, status, created_at, updated_at
         FROM conversations WHERE profile_id = ? AND status = 'active'`, profileID))
@@ -285,6 +355,7 @@ func (j *Journal) CurrentConversation(profileID string) (domain.Conversation, er
 	return j.NewConversation(profileID)
 }
 
+// Conversations 返回指定档案的全部会话，按更新时间倒序排列。
 func (j *Journal) Conversations(profileID string) ([]domain.Conversation, error) {
 	rows, err := j.db.Query(`SELECT id, profile_id, title, status, created_at, updated_at
         FROM conversations WHERE profile_id = ? ORDER BY updated_at DESC`, profileID)
@@ -306,6 +377,7 @@ func (j *Journal) Conversations(profileID string) ([]domain.Conversation, error)
 	return conversations, nil
 }
 
+// ActivateConversation 切换指定档案的 active 会话：归档当前会话并激活目标会话。
 func (j *Journal) ActivateConversation(profileID, conversationID string) (domain.Conversation, error) {
 	now := time.Now().UTC()
 	tx, err := j.db.Begin()
@@ -333,6 +405,7 @@ func (j *Journal) ActivateConversation(profileID, conversationID string) (domain
 	return j.CurrentConversation(profileID)
 }
 
+// NewConversation 将档案现有 active 会话归档，并创建一个新会话。
 func (j *Journal) NewConversation(profileID string) (domain.Conversation, error) {
 	now := time.Now().UTC()
 	conversation := domain.Conversation{
@@ -360,6 +433,7 @@ func (j *Journal) NewConversation(profileID string) (domain.Conversation, error)
 	return conversation, nil
 }
 
+// StartRun 在单个事务中写入 run 记录、更新会话标题并追加启动事件。
 func (j *Journal) StartRun(run domain.Run, event domain.Event) error {
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {
@@ -370,8 +444,8 @@ func (j *Journal) StartRun(run domain.Run, event domain.Event) error {
 		return fmt.Errorf("begin diagnostic run: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`INSERT INTO runs(id, conversation_id, profile_id, goal, status, started_at)
-        VALUES(?, ?, ?, ?, ?, ?)`, run.ID, run.ConversationID, run.ProfileID, run.Goal, run.Status, databaseTime(run.StartedAt)); err != nil {
+	if _, err = tx.Exec(`INSERT INTO runs(id, conversation_id, profile_id, goal, mode, status, started_at)
+	        VALUES(?, ?, ?, ?, ?, ?, ?)`, run.ID, run.ConversationID, run.ProfileID, run.Goal, run.Mode, run.Status, databaseTime(run.StartedAt)); err != nil {
 		return fmt.Errorf("store diagnostic run: %w", err)
 	}
 	if _, err = tx.Exec(`UPDATE conversations SET title = CASE WHEN title = '' THEN ? ELSE title END, updated_at = ? WHERE id = ?`, run.Goal, databaseTime(run.StartedAt), run.ConversationID); err != nil {
@@ -386,6 +460,7 @@ func (j *Journal) StartRun(run domain.Run, event domain.Event) error {
 	return nil
 }
 
+// FinishRun 更新 run 的终态与结束时间，保存最终上下文快照，并追加终态事件。
 func (j *Journal) FinishRun(run domain.Run, runError string, contextJSON []byte, event domain.Event) error {
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {
@@ -420,10 +495,9 @@ func (j *Journal) FinishRun(run domain.Run, runError string, contextJSON []byte,
 	return nil
 }
 
-// SaveContext stores a recoverable Eino message boundary while a run is still
-// active. FinishRun intentionally remains responsible for the run status and
-// terminal event; this method only advances the conversation snapshot so an
-// application restart does not discard an otherwise useful diagnostic turn.
+// SaveContext 在 run 仍运行期间保存可恢复的 Eino 消息边界。
+// run 状态与终态事件仍由 FinishRun 负责；本方法只推进会话快照，
+// 使应用重启时不会丢失已完成的诊断轮次。
 func (j *Journal) SaveContext(conversationID, sourceRunID string, contextJSON []byte) error {
 	if len(contextJSON) == 0 {
 		return nil
@@ -762,6 +836,59 @@ func (j *Journal) EvidenceByConversation(conversationID, evidenceID string) (dom
 		return domain.Evidence{}, false, fmt.Errorf("iterate conversation evidence events: %w", err)
 	}
 	return domain.Evidence{}, false, nil
+}
+
+// SaveTokenUsage persists one model-generation usage record. Each ChatModel
+// generation inside a run appends one row; downstream callers can sum per run
+// or per conversation to show real token cost and latency instead of estimates.
+func (j *Journal) SaveTokenUsage(record domain.TokenUsageRecord) error {
+	if strings.TrimSpace(record.ID) == "" {
+		return errors.New("token usage record ID is required")
+	}
+	if strings.TrimSpace(record.RunID) == "" || strings.TrimSpace(record.ConversationID) == "" {
+		return errors.New("token usage record run and conversation IDs are required")
+	}
+	if record.RecordedAt.IsZero() {
+		record.RecordedAt = time.Now().UTC()
+	}
+	_, err := j.db.Exec(`INSERT INTO token_usage(
+        id, run_id, conversation_id, iteration, input_tokens, output_tokens, total_tokens, elapsed_ms, recorded_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.ID, record.RunID, record.ConversationID, record.Iteration,
+		record.InputTokens, record.OutputTokens, record.TotalTokens, record.ElapsedMS,
+		databaseTime(record.RecordedAt))
+	if err != nil {
+		return fmt.Errorf("store token usage: %w", err)
+	}
+	return nil
+}
+
+// TokenUsageByConversation returns token usage rows for a conversation in
+// model-generation order. Used to display per-turn cost/latency after a run.
+func (j *Journal) TokenUsageByConversation(conversationID string) ([]domain.TokenUsageRecord, error) {
+	rows, err := j.db.Query(`SELECT id, run_id, conversation_id, iteration, input_tokens, output_tokens, total_tokens, elapsed_ms, recorded_at
+        FROM token_usage WHERE conversation_id = ? ORDER BY recorded_at, iteration`, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("read token usage: %w", err)
+	}
+	defer rows.Close()
+	records := make([]domain.TokenUsageRecord, 0)
+	for rows.Next() {
+		var record domain.TokenUsageRecord
+		var recordedAt string
+		if err = rows.Scan(&record.ID, &record.RunID, &record.ConversationID, &record.Iteration,
+			&record.InputTokens, &record.OutputTokens, &record.TotalTokens, &record.ElapsedMS, &recordedAt); err != nil {
+			return nil, fmt.Errorf("scan token usage: %w", err)
+		}
+		if record.RecordedAt, err = parseDatabaseTime(recordedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate token usage: %w", err)
+	}
+	return records, nil
 }
 
 func insertEvent(tx *sql.Tx, event domain.Event, payload []byte) error {
