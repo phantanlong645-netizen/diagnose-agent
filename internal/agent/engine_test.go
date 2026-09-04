@@ -573,8 +573,13 @@ func TestWireTeamSourceDependenciesDoesNotCreateCycle(t *testing.T) {
 
 func TestBuildTeamWorkerResultAcceptsNaturalLanguageAndHostEvidence(t *testing.T) {
 	result, err := buildTeamWorkerResult(
+		TeamWorkInput{Step: TeamStep{Role: "platform"}},
 		"Observed: ONT is discovered but not activated [ev-platform].",
-		[]string{"ev-platform", "ev-device", "ev-platform"},
+		[]domain.Evidence{
+			{ID: "ev-platform", Kind: "nbi_get"},
+			{ID: "ev-device", Kind: "read_ont_state"},
+			{ID: "ev-platform", Kind: "nbi_get"},
+		},
 		nil,
 		nil,
 		nil,
@@ -596,8 +601,9 @@ func TestBuildTeamWorkerResultAcceptsNaturalLanguageAndHostEvidence(t *testing.T
 func TestBuildTeamWorkerResultPreservesEvidenceAtIterationLimit(t *testing.T) {
 	limitErr := errors.New("[NodeRunError] pre processor fail: exceeds max iterations")
 	result, err := buildTeamWorkerResult(
+		TeamWorkInput{Step: TeamStep{Role: "device"}},
 		"",
-		[]string{"ev-1"},
+		[]domain.Evidence{{ID: "ev-1", Kind: "read_ont_state"}},
 		[]string{`{"evidenceId":"ev-1","summary":"NBI returned HTTP 200","data":{"status":"discovered"}}`},
 		nil,
 		limitErr,
@@ -614,9 +620,94 @@ func TestBuildTeamWorkerResultPreservesEvidenceAtIterationLimit(t *testing.T) {
 }
 
 func TestBuildTeamWorkerResultFailsWithoutReportOrEvidence(t *testing.T) {
-	_, err := buildTeamWorkerResult("", nil, nil, nil, nil)
+	_, err := buildTeamWorkerResult(TeamWorkInput{}, "", nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "without evidence") {
 		t.Fatalf("expected empty worker result to fail, got %v", err)
+	}
+}
+
+func TestBuildTeamWorkerResultAcceptsReferencedDependencyEvidence(t *testing.T) {
+	const evidenceID = "93da4951-a234-4ef0-9d92-317c2ad2949c"
+	result, err := buildTeamWorkerResult(
+		TeamWorkInput{
+			Step: TeamStep{Role: "correlator"},
+			Dependencies: map[string]TeamStepResult{
+				"device": {EvidenceIDs: []string{evidenceID}},
+			},
+		},
+		"The device observation is established by `93da4951`.",
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != teamStepSuccess {
+		t.Fatalf("status = %q, want %q: %+v", result.Status, teamStepSuccess, result)
+	}
+	if len(result.ReferencedEvidenceIDs) != 1 || result.ReferencedEvidenceIDs[0] != evidenceID {
+		t.Fatalf("validated dependency evidence was not recorded: %+v", result.ReferencedEvidenceIDs)
+	}
+	if len(result.EvidenceIDs) != 0 {
+		t.Fatalf("dependency evidence was incorrectly counted as newly collected: %+v", result.EvidenceIDs)
+	}
+}
+
+func TestBuildTeamWorkerResultRejectsUnregisteredEvidenceReference(t *testing.T) {
+	result, err := buildTeamWorkerResult(
+		TeamWorkInput{
+			Step: TeamStep{Role: "correlator"},
+			Dependencies: map[string]TeamStepResult{
+				"device": {EvidenceIDs: []string{"93da4951-a234-4ef0-9d92-317c2ad2949c"}},
+			},
+		},
+		"The conclusion is established by `deadbeef`.",
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != teamStepPartial || len(result.ReferencedEvidenceIDs) != 0 {
+		t.Fatalf("unregistered evidence reference was accepted: %+v", result)
+	}
+}
+
+func TestBuildTeamWorkerResultMarksToolErrorsPartial(t *testing.T) {
+	result, err := buildTeamWorkerResult(
+		TeamWorkInput{Step: TeamStep{Role: "source"}},
+		"The handler validates the request before dispatch.",
+		[]domain.Evidence{{ID: "ev-read", Kind: "read_file", Data: map[string]any{"content": "handler"}}},
+		nil,
+		[]string{"open file: path was not found"},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != teamStepPartial {
+		t.Fatalf("tool error did not produce a partial result: %+v", result)
+	}
+}
+
+func TestBuildTeamWorkerResultMarksEmptySourceSearchPartial(t *testing.T) {
+	result, err := buildTeamWorkerResult(
+		TeamWorkInput{Step: TeamStep{Role: "source"}},
+		"No matching definition was located.",
+		[]domain.Evidence{{ID: "ev-search", Kind: "search_files", Data: map[string]any{"matches": []any{}}}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != teamStepPartial {
+		t.Fatalf("empty repository search was treated as substantive evidence: %+v", result)
 	}
 }
 

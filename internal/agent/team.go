@@ -80,15 +80,16 @@ type TeamFact struct {
 // TeamStepResult 是 worker 之间唯一共享的信息。各 worker 的聊天历史互相隔离，
 // 大段原始负载仍保留在 Evidence 存储中。
 type TeamStepResult struct {
-	StepID      string     `json:"stepId"`
-	Role        string     `json:"role"`
-	Status      string     `json:"status"`
-	Summary     string     `json:"summary"`
-	Facts       []TeamFact `json:"facts,omitempty"`
-	EvidenceIDs []string   `json:"evidenceIds,omitempty"`
-	Unknowns    []string   `json:"unknowns,omitempty"`
-	Error       string     `json:"error,omitempty"`
-	SkipFrom    string     `json:"skipFrom,omitempty"`
+	StepID                string     `json:"stepId"`
+	Role                  string     `json:"role"`
+	Status                string     `json:"status"`
+	Summary               string     `json:"summary"`
+	Facts                 []TeamFact `json:"facts,omitempty"`
+	EvidenceIDs           []string   `json:"evidenceIds,omitempty"`
+	ReferencedEvidenceIDs []string   `json:"referencedEvidenceIds,omitempty"`
+	Unknowns              []string   `json:"unknowns,omitempty"`
+	Error                 string     `json:"error,omitempty"`
+	SkipFrom              string     `json:"skipFrom,omitempty"`
 }
 
 // TeamWorkInput 是 worker 的输入：原始目标、当前步骤以及依赖步骤的结构化结果。
@@ -125,6 +126,7 @@ type FuncPlanner func(ctx context.Context, goal string) ([]TeamStep, error)
 
 func (f FuncPlanner) Plan(ctx context.Context, goal string) ([]TeamStep, error) { return f(ctx, goal) }
 
+// FuncWorker 把普通函数适配成 TeamWorker 接口。
 type FuncWorker func(ctx context.Context, input TeamWorkInput) (TeamStepResult, error)
 
 func (f FuncWorker) Work(ctx context.Context, input TeamWorkInput) (TeamStepResult, error) {
@@ -271,6 +273,7 @@ func normalizeTeamStepResult(step TeamStep, result TeamStepResult, workErr error
 	result.Role = step.Role
 	result.Summary = strings.TrimSpace(result.Summary)
 	result.EvidenceIDs = uniqueStrings(result.EvidenceIDs)
+	result.ReferencedEvidenceIDs = uniqueStrings(result.ReferencedEvidenceIDs)
 	result.Unknowns = uniqueStrings(result.Unknowns)
 	if workErr != nil {
 		result.Status = teamStepFailed
@@ -307,6 +310,7 @@ Roles and host-enforced capabilities:
 - source: local code, YANG, route catalog, and design-document investigation.
 - web: public vendor documentation, standards, release notes, and known issues.
 - correlator: compare dependency evidence; it can only re-read evidence by ID.
+The host may add locally configured read-only MCP tools to a matching role. Never assume an MCP capability exists and never place a tool name in the plan.
 
 Rules:
 - Return 1 to 6 steps. Prefer 2 to 4 independent evidence steps.
@@ -442,7 +446,7 @@ const teamReviewerPrompt = `You are the Reviewer for an OLT diagnostic superviso
 Produce one evidence-grounded final answer in Simplified Chinese from the structured worker results.
 Distinguish observed facts from inference. Cite evidence IDs next to important facts. Reconcile contradictions explicitly.
 Cite each evidence ID using Markdown inline-code formatting so the UI can resolve it to the persisted evidence item.
-The host-populated evidenceIds arrays are authoritative. Never treat an ID mentioned only inside a worker summary as valid evidence when it is absent from that worker's evidenceIds array.
+The host-populated evidenceIds and referencedEvidenceIds arrays are authoritative. evidenceIds are newly captured by that worker; referencedEvidenceIds are host-validated references to dependency evidence. Never trust an ID mentioned only inside a worker summary when it is absent from both arrays.
 If a worker is partial, failed, or skipped, state the exact remaining evidence gap without inventing a result.
 Do not claim a diagnosis is certain when the available evidence only supports a hypothesis.`
 
@@ -860,7 +864,13 @@ func (e *Engine) runTeamWorker(ctx context.Context, run domain.Run, chatModel mo
 	if err != nil {
 		return TeamStepResult{}, err
 	}
-	allowedTools, err := selectTeamTools(ctx, allTools, teamRoleTools[input.Step.Role])
+	allowedNames := append([]string(nil), teamRoleTools[input.Step.Role]...)
+	for _, info := range e.runner.MCPToolInfosForRole(input.Step.Role) {
+		allowedNames = append(allowedNames, info.Name)
+	}
+	allowedNames = uniqueStrings(allowedNames)
+	sort.Strings(allowedNames)
+	allowedTools, err := selectTeamTools(ctx, allTools, allowedNames)
 	if err != nil {
 		return TeamStepResult{}, err
 	}
@@ -868,8 +878,6 @@ func (e *Engine) runTeamWorker(ctx context.Context, run domain.Run, chatModel mo
 	if err != nil {
 		return TeamStepResult{}, fmt.Errorf("encode dependency results: %w", err)
 	}
-	allowedNames := append([]string(nil), teamRoleTools[input.Step.Role]...)
-	sort.Strings(allowedNames)
 	workerInstruction := fmt.Sprintf(`%s
 
 <isolated-team-worker>
@@ -932,7 +940,7 @@ Your final response is a concise evidence report for the supervisor, not JSON. S
 	workerRunner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: workerAgent})
 	events := workerRunner.Run(ctx, []*schema.Message{schema.UserMessage(workerPrompt)})
 	finalContent := ""
-	evidenceIDs := make([]string, 0)
+	evidenceItems := make([]domain.Evidence, 0)
 	evidenceDigests := make([]string, 0)
 	toolErrors := make([]string, 0)
 	var iterationLimitErr error
@@ -960,7 +968,7 @@ Your final response is a concise evidence report for the supervisor, not JSON. S
 			var observation agentToolObservation
 			if json.Unmarshal([]byte(message.Content), &observation) == nil {
 				if observation.Evidence != nil {
-					evidenceIDs = append(evidenceIDs, observation.Evidence.ID)
+					evidenceItems = append(evidenceItems, *observation.Evidence)
 					evidenceDigests = append(evidenceDigests, compactTeamEvidence(*observation.Evidence))
 				}
 				if observation.Error != "" {
@@ -985,7 +993,7 @@ Your final response is a concise evidence report for the supervisor, not JSON. S
 			toolErrors = append(toolErrors, "No-tool finalization failed: "+err.Error())
 		}
 	}
-	return buildTeamWorkerResult(finalContent, evidenceIDs, evidenceDigests, toolErrors, iterationLimitErr)
+	return buildTeamWorkerResult(input, finalContent, evidenceItems, evidenceDigests, toolErrors, iterationLimitErr)
 }
 
 // finalizeTeamWorkerReport 在 worker 达到迭代上限却未产出报告时，
@@ -1055,12 +1063,17 @@ func selectTeamTools(ctx context.Context, available []einotool.BaseTool, allowed
 	return selected, nil
 }
 
-func buildTeamWorkerResult(content string, evidenceIDs, evidenceDigests, toolErrors []string, iterationErr error) (TeamStepResult, error) {
+func buildTeamWorkerResult(input TeamWorkInput, content string, evidenceItems []domain.Evidence, evidenceDigests, toolErrors []string, iterationErr error) (TeamStepResult, error) {
 	content = strings.TrimSpace(content)
+	evidenceIDs := make([]string, 0, len(evidenceItems))
+	for _, evidence := range evidenceItems {
+		evidenceIDs = append(evidenceIDs, evidence.ID)
+	}
 	evidenceIDs = uniqueStrings(evidenceIDs)
+	referencedEvidenceIDs := referencedDependencyEvidence(content, input.Dependencies)
 	toolErrors = uniqueStrings(toolErrors)
 
-	if content == "" && len(evidenceIDs) == 0 {
+	if content == "" && len(evidenceIDs) == 0 && len(referencedEvidenceIDs) == 0 {
 		if iterationErr != nil {
 			return TeamStepResult{}, iterationErr
 		}
@@ -1071,9 +1084,10 @@ func buildTeamWorkerResult(content string, evidenceIDs, evidenceDigests, toolErr
 	}
 
 	result := TeamStepResult{
-		Status:      teamStepSuccess,
-		Summary:     abbreviateContext(content, teamWorkerReportMax),
-		EvidenceIDs: evidenceIDs,
+		Status:                teamStepSuccess,
+		Summary:               abbreviateContext(content, teamWorkerReportMax),
+		EvidenceIDs:           evidenceIDs,
+		ReferencedEvidenceIDs: referencedEvidenceIDs,
 	}
 	if content == "" {
 		result.Status = teamStepPartial
@@ -1082,9 +1096,13 @@ func buildTeamWorkerResult(content string, evidenceIDs, evidenceDigests, toolErr
 			result.Summary += "\n\nHost-preserved evidence snapshots:\n" + abbreviateContext(digest, teamWorkerReportMax-len(result.Summary))
 		}
 	}
-	if len(evidenceIDs) == 0 {
+	if len(evidenceIDs) == 0 && len(referencedEvidenceIDs) == 0 {
 		result.Status = teamStepPartial
-		result.Unknowns = append(result.Unknowns, "No successful tool evidence was captured for this worker.")
+		result.Unknowns = append(result.Unknowns, "No successful tool evidence or validated dependency evidence was captured for this worker.")
+	}
+	if input.Step.Role == "source" && len(evidenceItems) > 0 && !hasSubstantiveSourceEvidence(evidenceItems) {
+		result.Status = teamStepPartial
+		result.Unknowns = append(result.Unknowns, "Repository searches completed but returned no candidate content to support the source conclusion.")
 	}
 	if iterationErr != nil {
 		result.Status = teamStepPartial
@@ -1092,10 +1110,85 @@ func buildTeamWorkerResult(content string, evidenceIDs, evidenceDigests, toolErr
 		result.Unknowns = append(result.Unknowns, "The worker reached its bounded investigation limit before a normal final response.")
 	}
 	if len(toolErrors) > 0 {
+		result.Status = teamStepPartial
 		result.Unknowns = append(result.Unknowns, toolErrors...)
 	}
 	result.Unknowns = uniqueStrings(result.Unknowns)
 	return result, nil
+}
+
+// referencedDependencyEvidence 只承认依赖结果中由宿主登记的证据 ID，
+// 防止 worker 在自然语言报告中伪造或误写证据引用。
+func referencedDependencyEvidence(content string, dependencies map[string]TeamStepResult) []string {
+	content = strings.ToLower(content)
+	if content == "" || len(dependencies) == 0 {
+		return nil
+	}
+
+	allowed := make([]string, 0)
+	for _, dependency := range dependencies {
+		allowed = append(allowed, dependency.EvidenceIDs...)
+		allowed = append(allowed, dependency.ReferencedEvidenceIDs...)
+	}
+	allowed = uniqueStrings(allowed)
+	sort.Strings(allowed)
+
+	prefixCounts := make(map[string]int, len(allowed))
+	for _, evidenceID := range allowed {
+		if len(evidenceID) >= 8 {
+			prefixCounts[strings.ToLower(evidenceID[:8])]++
+		}
+	}
+
+	referenced := make([]string, 0, len(allowed))
+	for _, evidenceID := range allowed {
+		lowerID := strings.ToLower(evidenceID)
+		if strings.Contains(content, lowerID) {
+			referenced = append(referenced, evidenceID)
+			continue
+		}
+		if len(lowerID) >= 8 {
+			prefix := lowerID[:8]
+			if prefixCounts[prefix] == 1 && strings.Contains(content, prefix) {
+				referenced = append(referenced, evidenceID)
+			}
+		}
+	}
+	return referenced
+}
+
+func hasSubstantiveSourceEvidence(evidenceItems []domain.Evidence) bool {
+	for _, evidence := range evidenceItems {
+		switch strings.ToLower(strings.TrimSpace(evidence.Kind)) {
+		case "search_files":
+			if searchEvidenceCandidateCount(evidence.Data, "matches") > 0 {
+				return true
+			}
+		case "search_code":
+			if searchEvidenceCandidateCount(evidence.Data, "results") > 0 {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func searchEvidenceCandidateCount(data any, field string) int {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return 0
+	}
+	var result map[string]json.RawMessage
+	if json.Unmarshal(payload, &result) != nil {
+		return 0
+	}
+	var candidates []json.RawMessage
+	if json.Unmarshal(result[field], &candidates) != nil {
+		return 0
+	}
+	return len(candidates)
 }
 
 func compactTeamEvidence(evidence domain.Evidence) string {

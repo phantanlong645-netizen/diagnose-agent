@@ -279,6 +279,7 @@ func terms(s string) map[string]int {
 	return out
 }
 
+// cosine 计算两个 TF 词频向量的余弦相似度；任一向量为空时返回 0。
 func cosine(a, b map[string]int) float64 {
 	var dot, aa, bb float64
 	for k, av := range a {

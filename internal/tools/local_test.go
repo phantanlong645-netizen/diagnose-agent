@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -380,6 +382,226 @@ func TestNBIToolRefreshesJWTBeforeAcquiringWritePermission(t *testing.T) {
 	}
 	if loginCalls.Load() != 2 || leaseToken != "jwt-2" {
 		t.Fatalf("expected a fresh JWT before permission acquisition, logins=%d leaseToken=%q", loginCalls.Load(), leaseToken)
+	}
+}
+
+type recordingMCPClient struct {
+	results       map[string]json.RawMessage
+	calls         []string
+	notifications []string
+	protocol      string
+}
+
+func (c *recordingMCPClient) Call(_ context.Context, method string, _ any) (json.RawMessage, error) {
+	c.calls = append(c.calls, method)
+	return c.results[method], nil
+}
+
+func (c *recordingMCPClient) Notify(_ context.Context, method string, _ any) error {
+	c.notifications = append(c.notifications, method)
+	return nil
+}
+
+func (c *recordingMCPClient) SetProtocolVersion(version string) { c.protocol = version }
+func (c *recordingMCPClient) Close() error                      { return nil }
+
+func TestInitializeMCPSendsInitializedNotification(t *testing.T) {
+	client := &recordingMCPClient{results: map[string]json.RawMessage{
+		"initialize": json.RawMessage(`{"protocolVersion":"2025-03-26"}`),
+	}}
+	if err := initializeMCP(context.Background(), client); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.calls) != 1 || client.calls[0] != "initialize" {
+		t.Fatalf("unexpected calls: %v", client.calls)
+	}
+	if len(client.notifications) != 1 || client.notifications[0] != "notifications/initialized" {
+		t.Fatalf("initialized notification missing: %v", client.notifications)
+	}
+	if client.protocol != "2025-03-26" {
+		t.Fatalf("negotiated protocol was not retained: %q", client.protocol)
+	}
+}
+
+func TestMCPToolPoliciesAreHostAuthoritativeForTeamRoles(t *testing.T) {
+	disabled := false
+	client := &recordingMCPClient{results: map[string]json.RawMessage{
+		"tools/list": json.RawMessage(`{"tools":[
+			{"name":"unclassified","description":"unknown safety","inputSchema":{"type":"object"}},
+			{"name":"lookup_ont","description":"read inventory","inputSchema":{"type":"object"}},
+			{"name":"browser_control","description":"can click","inputSchema":{"type":"object"}},
+			{"name":"disabled_tool","description":"off","inputSchema":{"type":"object"}}
+		]}`),
+	}}
+	policies := map[string]mcpToolPolicy{
+		"lookup_ont":    {ReadOnly: true, Idempotent: true, TeamRoles: []string{"platform"}},
+		"disabled_tool": {Enabled: &disabled},
+	}
+	loaded, err := listMCPTools(context.Background(), "inventory", policies, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 3 {
+		t.Fatalf("expected three enabled tools, got %d", len(loaded))
+	}
+	registry := NewRegistry()
+	for _, tool := range loaded {
+		if err = registry.Register(tool); err != nil {
+			t.Fatal(err)
+		}
+	}
+	platform := registry.MCPToolInfosForRole("platform")
+	if len(platform) != 1 || platform[0].RemoteName != "lookup_ont" {
+		t.Fatalf("unexpected platform MCP tools: %+v", platform)
+	}
+	if got := registry.MCPToolInfosForRole("source"); len(got) != 0 {
+		t.Fatalf("unclassified MCP tool leaked into source role: %+v", got)
+	}
+	_, prepared, err := registry.Prepare(domain.ToolCall{Name: "mcp__inventory__unclassified", Arguments: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Annotations.ReadOnly || !prepared.Annotations.OpenWorld {
+		t.Fatalf("unclassified tool must remain approval-gated open-world: %+v", prepared.Annotations)
+	}
+}
+
+func TestValidateMCPToolPoliciesRejectsUnsafeTeamGrant(t *testing.T) {
+	err := validateMCPToolPolicies(map[string]mcpToolPolicy{
+		"click": {TeamRoles: []string{"web"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "readOnly=true") {
+		t.Fatalf("expected unsafe team grant rejection, got %v", err)
+	}
+}
+
+func TestLoadMCPReportsHTTPStatusAndUsesNegotiatedSession(t *testing.T) {
+	var initialized atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var message struct {
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&message); err != nil {
+			t.Errorf("decode MCP request: %v", err)
+			response.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch message.Method {
+		case "initialize":
+			response.Header().Set("Mcp-Session-Id", "session-1")
+			response.Header().Set("Content-Type", "application/json")
+			_, _ = response.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}`))
+		case "notifications/initialized":
+			if request.Header.Get("Mcp-Session-Id") != "session-1" || request.Header.Get("MCP-Protocol-Version") != "2025-03-26" {
+				t.Errorf("notification missing negotiated headers: session=%q protocol=%q", request.Header.Get("Mcp-Session-Id"), request.Header.Get("MCP-Protocol-Version"))
+			}
+			initialized.Store(true)
+			response.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			if !initialized.Load() {
+				t.Error("tools/list arrived before initialized notification")
+			}
+			response.Header().Set("Content-Type", "text/event-stream")
+			_, _ = response.Write([]byte("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"lookup_ont\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n"))
+		default:
+			t.Errorf("unexpected MCP method %q", message.Method)
+			response.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	configPath := filepath.Join(t.TempDir(), "mcp.json")
+	configuration, err := json.Marshal(map[string]any{"mcpServers": map[string]any{
+		"inventory": map[string]any{
+			"url": server.URL,
+			"toolPolicies": map[string]any{"lookup_ont": map[string]any{
+				"readOnly": true, "idempotent": true, "teamRoles": []string{"platform"},
+			}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(configPath, configuration, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := LoadMCP(context.Background(), configPath)
+	defer manager.Close()
+	status := manager.Status()
+	if !status.Configured || status.ConfigError != "" || len(status.Servers) != 1 {
+		t.Fatalf("unexpected MCP status: %+v", status)
+	}
+	if !status.Servers[0].Connected || status.Servers[0].ToolCount != 1 || status.Servers[0].Transport != "http" {
+		t.Fatalf("unexpected MCP server status: %+v", status.Servers[0])
+	}
+	if len(manager.Tools()) != 1 || len(manager.Tools()[0].teamRoles) != 1 || manager.Tools()[0].teamRoles[0] != "platform" {
+		t.Fatalf("unexpected discovered MCP tools: %+v", manager.Tools())
+	}
+}
+
+func TestStdioMCPClientPairsConcurrentResponsesByID(t *testing.T) {
+	serverRequests, clientInput := io.Pipe()
+	clientOutput, serverResponses := io.Pipe()
+	client := &stdioMCPClient{
+		stdin: clientInput, pending: make(map[string]chan mcpResponse), done: make(chan struct{}),
+	}
+	responseScanner := bufio.NewScanner(clientOutput)
+	go client.readResponses(responseScanner)
+	defer func() {
+		_ = client.Close()
+		_ = serverRequests.Close()
+		_ = serverResponses.Close()
+	}()
+
+	go func() {
+		scanner := bufio.NewScanner(serverRequests)
+		requests := make([]map[string]any, 0, 2)
+		for scanner.Scan() {
+			var request map[string]any
+			if json.Unmarshal(scanner.Bytes(), &request) == nil {
+				requests = append(requests, request)
+			}
+			if len(requests) == 2 {
+				for index := len(requests) - 1; index >= 0; index-- {
+					response, _ := json.Marshal(map[string]any{
+						"jsonrpc": "2.0", "id": requests[index]["id"],
+						"result": map[string]any{"method": requests[index]["method"]},
+					})
+					_, _ = serverResponses.Write(append(response, '\n'))
+				}
+				return
+			}
+		}
+	}()
+
+	results := make(map[string]string, 2)
+	var resultMu sync.Mutex
+	var wait sync.WaitGroup
+	for _, method := range []string{"first", "second"} {
+		method := method
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			raw, err := client.Call(context.Background(), method, map[string]any{})
+			if err != nil {
+				t.Errorf("%s call failed: %v", method, err)
+				return
+			}
+			var result struct {
+				Method string `json:"method"`
+			}
+			if err = json.Unmarshal(raw, &result); err != nil {
+				t.Errorf("decode %s result: %v", method, err)
+				return
+			}
+			resultMu.Lock()
+			results[method] = result.Method
+			resultMu.Unlock()
+		}()
+	}
+	wait.Wait()
+	if results["first"] != "first" || results["second"] != "second" {
+		t.Fatalf("responses were mispaired: %+v", results)
 	}
 }
 

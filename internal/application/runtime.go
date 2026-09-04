@@ -578,6 +578,7 @@ func (j *Journal) Events(conversationID string) ([]domain.Event, error) {
 	return events, nil
 }
 
+// Context 返回指定会话最近保存的上下文快照，不存在时返回 found=false。
 func (j *Journal) Context(conversationID string) ([]byte, bool, error) {
 	var content []byte
 	err := j.db.QueryRow("SELECT messages_json FROM conversation_contexts WHERE conversation_id = ?", conversationID).Scan(&content)

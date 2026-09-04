@@ -14,13 +14,13 @@ Local-first Windows workbench for diagnosing OLT provisioning failures. It combi
   - `netconf_rpc` — NETCONF over SSH
   - `search_files` / `read_file` / `write_file` / `run_shell` — workspace-scoped tools
   - `web_search` / `web_fetch` — read-only web search and page fetch (SearXNG, SerpAPI, or DuckDuckGo backends)
-  - `code_search` — RAG-based semantic code search over configured workspace roots
+  - `search_code` — RAG-based semantic code search over configured workspace roots
   - `read_evidence` — resolve evidence collected during a run
   - MCP tools — stdio/HTTP MCP servers declared in the application config directory's `mcp.json`
 - **Deterministic policy enforcement** outside the model:
   - Read-only NBI, NETCONF, and ordinary workspace reads run automatically.
   - HTTP writes, NETCONF configuration RPCs, local writes, shell commands, and sensitive file reads pause for explicit one-time approval (optionally per-conversation).
-  - MCP tools are treated as open-world and always require user approval.
+  - Unclassified MCP tools are treated as open-world and require user approval; locally classified read-only tools may be assigned to specific Deep Team roles.
 - **Attachments** — text and PDF attachments are injected into the goal; image attachments are sent to the model as multimodal content.
 - **Structured run events** — approvals, redacted evidence, raw-response inspection, and a live trace that includes context compaction.
 - **Manual diagnostic sessions** — run a single tool call manually, with natural-language draft generation that never contacts the OLT.
@@ -56,6 +56,33 @@ Model configuration is verified with a small chat request (20-second window) bef
 - Configuration: `%AppData%\OLT Diagnostic Agent\config.json` (profiles + model settings).
 - Conversation/run/event history: `%AppData%\OLT Diagnostic Agent\diagnostics.db` (append-only SQLite). A completed diagnostic turn updates its run state and context snapshot in one transaction, so the next turn for the same target resumes the conversation even after a restart.
 - RAG index: persisted under the application config directory (`rag/`); workspace-root drift triggers automatic reindexing.
+
+## MCP configuration
+
+The desktop app loads `%AppData%\OLT Diagnostic Agent\mcp.json`. `config/mcporter.json` is an example only; copy the required server entries into the runtime file. A compact connection/tool count is shown in the Agent readiness card so a missing file or failed server is visible instead of being silently ignored.
+
+```json
+{
+  "mcpServers": {
+    "inventory": {
+      "command": "inventory-mcp.exe",
+      "args": [],
+      "toolPolicies": {
+        "lookup_ont": {
+          "readOnly": true,
+          "idempotent": true,
+          "teamRoles": ["platform"]
+        },
+        "update_ont": {
+          "enabled": true
+        }
+      }
+    }
+  }
+}
+```
+
+Policies use the remote MCP tool name, before the local `mcp__server__tool` prefix is generated. Unlisted tools default to enabled for Standard Agent, but remain approval-gated and unavailable to Deep Team. `teamRoles` accepts `device`, `platform`, `source`, `web`, or `correlator` and requires `readOnly: true`; sensitive tools cannot be assigned to Team workers. General browser-control tools should remain Standard-only because clicking and form entry are state-changing operations.
 
 ## Target profiles
 

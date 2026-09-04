@@ -41,6 +41,8 @@ button { color: inherit; }
 .readiness-card span { font: 700 10px var(--mono); letter-spacing: .08em; }
 .readiness-card i { width: 8px; height: 8px; border-radius: 50%; background: var(--signal); }
 .readiness-card small { display: block; margin-top: 6px; color: var(--muted); font: 9px/1.5 var(--mono); }
+.readiness-card small.mcp-status { margin-top: 2px; overflow-wrap: anywhere; }
+.readiness-card small.mcp-status.error { color: #8d2a10; }
 .readiness-card p { margin: 7px 0 0; color: #8d2a10; font-size: 10px; line-height: 1.45; }
 .readiness-card.ready { border-color: #82b32a; background: #f4f9e7; }
 .readiness-card.ready i { background: #42bf55; box-shadow: 0 0 0 3px rgba(66,191,85,.13); }
@@ -167,12 +169,15 @@ button { color: inherit; }
 .worker-metrics { margin-bottom: 4px; }.worker-metrics span { color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }.worker-metrics span + span:before { content: "·"; margin-right: 5px; }
 .worker-result, .worker-activity { margin-top: 7px; }.worker-result > summary, .worker-activity > summary { color: var(--blue); font: 9px var(--mono); cursor: pointer; user-select: none; }
 .worker-result p { max-height: 150px; overflow: auto; margin: 7px 0 0; border-left: 2px solid var(--line); padding-left: 9px; white-space: pre-wrap; overflow-wrap: anywhere; color: #3f4942; font-size: 11px; line-height: 1.5; }
+.worker-unknowns { display: flex; flex-direction: column; gap: 3px; margin-top: 7px; border-left: 2px solid #c58b37; padding-left: 9px; }.worker-unknowns b { color: #9b6719; font: 8px var(--mono); }.worker-unknowns span { color: var(--muted); font: 9px/1.4 var(--mono); overflow-wrap: anywhere; }
 .worker-error { margin: 7px 0 0; border-left: 2px solid var(--signal); padding-left: 7px; color: #8d2a10; font: 9px/1.45 var(--mono); overflow-wrap: anywhere; }
 .worker-activity > div { display: flex; flex-direction: column; margin-top: 6px; border: 1px solid var(--line); }
 .worker-activity-row { width: 100%; display: grid; grid-template-columns: 54px minmax(0, 1fr); gap: 7px; border: 0; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.45); padding: 6px 7px; text-align: left; }
 .worker-activity-row:last-child { border-bottom: 0; }.worker-activity-row:not(:disabled) { cursor: pointer; }.worker-activity-row.evidence:hover { background: #f4f7e8; }
 .worker-activity-row > b { color: var(--muted); font: 8px var(--mono); }.worker-activity-row.evidence > b { color: #568211; }.worker-activity-row > span { min-width: 0; }.worker-activity-row strong { display: block; font: 700 9px var(--mono); text-transform: uppercase; }.worker-activity-row small { display: block; margin: 2px 0 0; color: var(--muted); font: 8px/1.35 var(--mono); overflow-wrap: anywhere; }
 .worker-evidence-links { margin-top: 7px; }.worker-evidence-links button { border: 1px solid #a8bf69; background: transparent; padding: 3px 5px; color: #4d6904; font: 8px var(--mono); cursor: pointer; }.worker-evidence-links button:disabled { border-color: var(--line); color: var(--muted); cursor: default; }
+.worker-evidence-links button.referenced { border-style: dashed; border-color: #aeb6b0; color: #59645d; }
+.worker-evidence-links button.referenced:disabled { border-color: var(--line); color: var(--muted); }
 .approval-bar { position: relative; flex: 0 0 auto; min-width: 0; max-height: min(240px, 35vh); margin: 0 22px 18px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 9px; align-items: center; background: var(--ink); color: white; border-top: 4px solid var(--signal); padding: 13px; box-shadow: 0 12px 40px rgba(10,20,14,.28); overflow: auto; }
 .approval-bar div { display: flex; flex-direction: column; min-width: 0; }.approval-bar span { color: var(--signal); font: 9px var(--mono); letter-spacing: .12em; }.approval-bar strong { margin: 3px 0; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.approval-bar small { color: #b8beb9; }
 .approval-bar pre { max-height: 120px; overflow: auto; margin: 8px 0 0; border: 1px solid #3f4942; padding: 7px; color: #d9e2da; white-space: pre-wrap; font: 9px/1.45 var(--mono); }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"olt-diagnostic-agent/internal/domain"
@@ -112,4 +113,24 @@ func (r *Registry) MCPToolInfos() []MCPToolInfo {
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
 	return infos
+}
+
+// MCPToolInfosForRole returns only tools explicitly authorized by the local
+// MCP policy for a read-only Team role. Remote server annotations are not used.
+func (r *Registry) MCPToolInfosForRole(role string) []MCPToolInfo {
+	role = strings.ToLower(strings.TrimSpace(role))
+	infos := r.MCPToolInfos()
+	filtered := make([]MCPToolInfo, 0, len(infos))
+	for _, info := range infos {
+		if !info.Annotations.ReadOnly || info.Annotations.Destructive || info.Annotations.Sensitive {
+			continue
+		}
+		for _, allowedRole := range info.TeamRoles {
+			if allowedRole == role {
+				filtered = append(filtered, info)
+				break
+			}
+		}
+	}
+	return filtered
 }

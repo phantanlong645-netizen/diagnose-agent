@@ -46,6 +46,18 @@ type appConfiguration struct {
 	Model    *domain.ModelSettings  `json:"model,omitempty"`
 }
 
+// NewApp 装配整个应用的依赖图并返回根组件。
+//
+// 顺序很关键，大致分为四段：
+//  1. 加载用户配置（config.json）与本地 SQLite journal（diagnostics.db）；
+//  2. 构造工具注册表并注册全部内置工具（NBI/NETCONF/文件 IO/搜索/写文件/shell/
+//     联网/网页抓取/代码检索/MCP/长期记忆），单个工具初始化失败立即中止启动；
+//  3. 用 registry + policy + journal + approval 组装 application.Runner，
+//     再为 Runner 挂 read_evidence 工具（支持跨 Run 解析旧 evidence ID）；
+//  4. 创建 agent.Engine 桥接器，并按需恢复持久化的模型配置；
+//
+// 返回的 *App 同时实现 EventSink（Emit 把事件通过 Wails 推给前端），
+// 因此也被注入 Runner 作为事件出口，构成"后端事件流 -> 前端"的唯一通道。
 func NewApp() (*App, error) {
 	configPath, err := applicationConfigPath()
 	if err != nil {
@@ -152,7 +164,8 @@ func NewApp() (*App, error) {
 
 	// paicli-go 迁移能力：MCP stdio/HTTP 双传输工具。配置在 config.json 同目录的
 	// mcp.json（{"mcpServers":{...}}）。单个 server 连接失败只跳过，不影响应用启动。
-	// MCP 工具统一标 OpenWorld，policy 会要求用户审批后才执行。
+	// 未分类 MCP 工具保持 OpenWorld 并由 policy 要求审批；只有本机配置明确
+	// 标记为只读且绑定 Team 角色的工具才会进入对应 worker。
 	app.mcp = tools.LoadMCP(context.Background(), filepath.Join(filepath.Dir(app.configPath), "mcp.json"))
 	for _, mcpTool := range app.mcp.Tools() {
 		if err = app.registry.Register(mcpTool); err != nil {
@@ -332,6 +345,9 @@ func (a *App) AgentReadiness(profileID string) domain.AgentReadiness {
 	readiness := domain.AgentReadiness{
 		BuiltinSkillLoaded: true,
 		ModelConfigured:    a.engine.Settings().Configured,
+	}
+	if a.mcp != nil {
+		readiness.MCP = a.mcp.Status()
 	}
 	for _, definition := range a.registry.Definitions() {
 		readiness.ToolNames = append(readiness.ToolNames, definition.Name)

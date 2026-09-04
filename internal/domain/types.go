@@ -245,9 +245,8 @@ type DiagnosticRequest struct {
 	Attachments []Attachment   `json:"attachments,omitempty"`
 }
 
-// ManualDraftMessage is one turn in the short-lived AI request-builder chat.
-// It intentionally contains only operator text, never target credentials or
-// live device responses.
+// ManualDraftMessage 是短暂的 AI 请求构建会话中的一轮对话。
+// 它只包含操作员文本，绝不包含目标凭据或真实设备响应。
 type ManualDraftMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -310,14 +309,32 @@ type ModelSettingsSummary struct {
 	APIKeyConfigured    bool   `json:"apiKeyConfigured"`
 }
 
+// MCPServerStatus is a secret-free startup snapshot for one configured server.
+type MCPServerStatus struct {
+	Name      string `json:"name"`
+	Transport string `json:"transport"`
+	Connected bool   `json:"connected"`
+	ToolCount int    `json:"toolCount"`
+	Error     string `json:"error,omitempty"`
+}
+
+// MCPStatus describes the canonical runtime configuration and discovered tools.
+type MCPStatus struct {
+	ConfigPath  string            `json:"configPath"`
+	Configured  bool              `json:"configured"`
+	ConfigError string            `json:"configError,omitempty"`
+	Servers     []MCPServerStatus `json:"servers,omitempty"`
+}
+
 type AgentReadiness struct {
-	Ready              bool     `json:"ready"`
-	TargetConfigured   bool     `json:"targetConfigured"`
-	ModelConfigured    bool     `json:"modelConfigured"`
-	BuiltinSkillLoaded bool     `json:"builtinSkillLoaded"`
-	ExternalSkillCount int      `json:"externalSkillCount"`
-	ToolNames          []string `json:"toolNames"`
-	Issues             []string `json:"issues,omitempty"`
+	Ready              bool      `json:"ready"`
+	TargetConfigured   bool      `json:"targetConfigured"`
+	ModelConfigured    bool      `json:"modelConfigured"`
+	BuiltinSkillLoaded bool      `json:"builtinSkillLoaded"`
+	ExternalSkillCount int       `json:"externalSkillCount"`
+	ToolNames          []string  `json:"toolNames"`
+	MCP                MCPStatus `json:"mcp"`
+	Issues             []string  `json:"issues,omitempty"`
 }
 
 type NBITarget struct {

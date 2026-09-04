@@ -76,6 +76,7 @@ type TeamStepResult = {
     status: 'success' | 'partial' | 'failed' | 'skipped' | string;
     summary?: string;
     evidenceIds?: string[];
+    referencedEvidenceIds?: string[];
     unknowns?: string[];
     error?: string;
 };
@@ -238,6 +239,12 @@ type AgentReadiness = {
     builtinSkillLoaded: boolean;
     externalSkillCount: number;
     toolNames: string[];
+    mcp: {
+        configPath: string;
+        configured: boolean;
+        configError?: string;
+        servers?: Array<{name: string; transport: string; connected: boolean; toolCount: number; error?: string}>;
+    };
     issues?: string[];
 };
 
@@ -712,6 +719,11 @@ function App() {
                     <div className={`readiness-card ${readiness?.ready ? 'ready' : 'blocked'}`}>
                         <div><span>{readiness?.ready ? 'AGENT READY' : readiness ? 'SETUP REQUIRED' : 'CHECKING'}</span><i/></div>
                         <small>{readiness?.toolNames?.length ?? 0} tools · built-in skill {readiness?.builtinSkillLoaded ? 'loaded' : 'missing'} · {readiness?.externalSkillCount ?? 0} external skills</small>
+                        {readiness?.mcp?.configured && <small className={`mcp-status ${readiness.mcp.configError || readiness.mcp.servers?.some(server => server.error) ? 'error' : ''}`} title={readiness.mcp.configPath}>
+                            MCP {readiness.mcp.servers?.filter(server => server.connected).length ?? 0}/{readiness.mcp.servers?.length ?? 0} connected · {readiness.mcp.servers?.reduce((total, server) => total + server.toolCount, 0) ?? 0} tools
+                            {(readiness.mcp.configError || readiness.mcp.servers?.find(server => server.error)?.error) && ` · ${readiness.mcp.configError || readiness.mcp.servers?.find(server => server.error)?.error}`}
+                        </small>}
+                        {readiness?.mcp && !readiness.mcp.configured && <small className="mcp-status" title={readiness.mcp.configPath}>MCP not configured</small>}
                         {!!readiness?.issues?.length && <p>{readiness.issues.join(' · ')}</p>}
                     </div>
                     <div className="mode-tabs"><button className={mode === 'agent' ? 'active' : ''} onClick={() => setMode('agent')}>AGENT</button><button className={mode === 'manual' ? 'active' : ''} onClick={() => setMode('manual')}>MANUAL</button></div>
@@ -932,25 +944,32 @@ function TeamExecutionBoard({planEvent, events, evidenceByID, onEvidence}: {
                         ...(result?.evidenceIds ?? []),
                         ...activities.filter(event => event.type === 'evidence.captured').map(event => String(event.payload?.id ?? '')).filter(Boolean),
                     ]));
+                    const referencedEvidenceIDs = Array.from(new Set(result?.referencedEvidenceIds ?? [])).filter(id => !evidenceIDs.includes(id));
+                    const evidenceLinks = [
+                        ...evidenceIDs.map(id => ({id, referenced: false})),
+                        ...referencedEvidenceIDs.map(id => ({id, referenced: true})),
+                    ];
                     const elapsed = started && finished ? Math.max(0, new Date(finished.timestamp).getTime() - new Date(started.timestamp).getTime()) : undefined;
                     return (
                         <article key={step.id} className={`team-worker-card role-${step.role} worker-${status}`}>
                             <div className="team-worker-topline">
                                 <span className="worker-index">{String(index + 1).padStart(2, '0')}</span>
                                 <span className="worker-role">{step.role}</span>
-                                <span className={`worker-status ${status}`}>{status}</span>
+                                <span className={`worker-status ${status}`} title={result?.error ?? result?.unknowns?.join('\n')}>{status}</span>
                             </div>
                             <small>SUB AGENT · {step.id}</small>
                             <h3>{step.goal}</h3>
                             {(step.dependsOn?.length ?? 0) > 0 && <div className="worker-dependencies"><span>等待上游</span>{step.dependsOn!.map(id => <code key={id}>{id}</code>)}</div>}
                             <div className="worker-metrics">
                                 <span>{activities.filter(item => item.type === 'tool.started').length} tools</span>
-                                <span>{evidenceIDs.length} evidence</span>
+                                <span>{evidenceIDs.length} new evidence</span>
+                                {referencedEvidenceIDs.length > 0 && <span>{referencedEvidenceIDs.length} referenced</span>}
                                 {elapsed !== undefined && <span>{formatDuration(elapsed)}</span>}
                             </div>
                             {result?.summary && <details className="worker-result">
                                 <summary>查看交接结果</summary>
                                 <p>{result.summary}</p>
+                                {!!result.unknowns?.length && <div className="worker-unknowns"><b>REMAINING GAPS</b>{result.unknowns.map((unknown, unknownIndex) => <span key={`${step.id}-unknown-${unknownIndex}`}>{unknown}</span>)}</div>}
                             </details>}
                             {result?.error && <p className="worker-error">{result.error}</p>}
                             {activities.length > 0 && <details className="worker-activity" open={status === 'running'}>
@@ -965,9 +984,10 @@ function TeamExecutionBoard({planEvent, events, evidenceByID, onEvidence}: {
                                     </button>;
                                 })}</div>
                             </details>}
-                            {evidenceIDs.length > 0 && <div className="worker-evidence-links">{evidenceIDs.map(id => {
+                            {evidenceLinks.length > 0 && <div className="worker-evidence-links">{evidenceLinks.map(({id, referenced}) => {
                                 const evidence = evidenceByID.get(id);
-                                return <button key={id} type="button" disabled={!evidence} title={id} onClick={() => evidence && onEvidence(evidence)}>{id.slice(0, 8)}</button>;
+                                const title = referenced ? `Referenced upstream evidence: ${id}` : `New evidence: ${id}`;
+                                return <button key={id} type="button" className={referenced ? 'referenced' : undefined} disabled={!evidence} title={title} onClick={() => evidence && onEvidence(evidence)}>{id.slice(0, 8)}</button>;
                             })}</div>}
                         </article>
                     );

@@ -297,7 +297,7 @@ func (r *Runner) SaveTokenUsage(record domain.TokenUsageRecord) error {
 	return r.journal.SaveTokenUsage(record)
 }
 
-// TokenUsageByConversation returns per-turn token usage and latency rows.
+// TokenUsageByConversation 返回每轮 token 用量与耗时记录。
 func (r *Runner) TokenUsageByConversation(conversationID string) ([]domain.TokenUsageRecord, error) {
 	return r.journal.TokenUsageByConversation(conversationID)
 }
@@ -571,6 +571,12 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 // the agent engine can build dynamic Eino tools with the correct JSON schema.
 func (r *Runner) MCPToolInfos() []tools.MCPToolInfo {
 	return r.registry.MCPToolInfos()
+}
+
+// MCPToolInfosForRole returns locally authorized read-only MCP tools for one
+// isolated Team worker role.
+func (r *Runner) MCPToolInfosForRole(role string) []tools.MCPToolInfo {
+	return r.registry.MCPToolInfosForRole(role)
 }
 
 // PrepareTool validates a proposed tool call without publishing events,

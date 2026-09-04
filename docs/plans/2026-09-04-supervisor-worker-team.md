@@ -95,3 +95,31 @@
 - **Data flow:** Planner supplies known literals and likely owner paths. If a literal must come from live data, the DAG passes the upstream platform/device result and evidence IDs first. The worker then uses the shared profile index and returns only its evidence report.
 - **Failure behavior:** Unsafe owner paths are rejected, dependency wiring avoids cycles, semantic search rebuilds are disabled inside workers, and exceeding the search budget produces an explicit tool observation so the worker can finalize a partial result.
 - **Trade-off:** Owner paths are guidance rather than a second filesystem authorization boundary; the existing workspace-root policy remains authoritative. This avoids duplicating path-policy logic while the hard search and result caps prevent repository-wide fanout.
+
+### Task 8: Add role-scoped MCP tools
+
+**Goal:** Make external MCP tools observable and usable without weakening the Team worker read-only boundary.
+
+**Architecture:** `mcp.json` remains the host-authoritative configuration. Every enabled MCP tool is available to Standard Agent; unclassified tools retain open-world approval, while locally classified read-only tools follow the existing read-only policy. A tool enters Deep Team only when its policy explicitly sets `readOnly: true` and binds one or more supported worker roles; remote MCP annotations alone never grant Team access.
+
+1. Extend each MCP server with per-remote-tool `toolPolicies` containing `enabled`, `readOnly`, `idempotent`, `sensitive`, and `teamRoles`.
+2. Preserve default behavior for unlisted tools: enabled for Standard Agent, open-world, approval required, and unavailable to Team.
+3. Filter configured read-only MCP tools into the matching Team role while retaining the role's built-in allowlist.
+4. Send `notifications/initialized` after the legacy MCP handshake and make stdio response dispatch safe for concurrent calls.
+5. Record config, connection, discovery, and tool-count status without exposing header or environment secrets.
+6. Surface a compact MCP status line in Agent readiness; MCP remains optional and does not block built-in diagnosis.
+7. Add policy, role-filtering, lifecycle, and concurrent-response tests in existing test files; run focused Go tests and the frontend production build.
+
+#### Security decision: local policy overrides remote claims
+
+- **Decision:** Only local `toolPolicies` may grant Team access. Server-provided `annotations.readOnlyHint` can be parsed for diagnostics later, but cannot authorize execution.
+- **Why:** An MCP server is an external trust boundary and may mislabel a mutating tool. Host-owned least-privilege policy keeps worker execution deterministic and auditable.
+- **Failure behavior:** Missing configuration means no MCP tools; malformed configuration or a failed server is reported in readiness; one failed server does not prevent other servers or built-in tools from loading.
+
+### Task 9: Distinguish collected and referenced evidence
+
+1. Keep `evidenceIds` as the evidence newly captured by a worker.
+2. Add host-validated `referencedEvidenceIds` for dependency evidence actually cited in the worker report.
+3. Allow a correlator with a normal report and valid upstream references to succeed without making redundant tool calls.
+4. Mark tool failures, iteration-limit exits, and source-only empty search results as partial.
+5. Show new and referenced evidence separately while keeping both kinds clickable in the existing evidence inspector.

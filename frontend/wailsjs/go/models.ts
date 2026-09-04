@@ -1,4 +1,60 @@
 export namespace domain {
+	export class MCPServerStatus {
+	    name: string;
+	    transport: string;
+	    connected: boolean;
+	    toolCount: number;
+	    error?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new MCPServerStatus(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.transport = source["transport"];
+	        this.connected = source["connected"];
+	        this.toolCount = source["toolCount"];
+	        this.error = source["error"];
+	    }
+	}
+	export class MCPStatus {
+	    configPath: string;
+	    configured: boolean;
+	    configError?: string;
+	    servers?: MCPServerStatus[];
+
+	    static createFrom(source: any = {}) {
+	        return new MCPStatus(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.configPath = source["configPath"];
+	        this.configured = source["configured"];
+	        this.configError = source["configError"];
+	        this.servers = this.convertValues(source["servers"], MCPServerStatus);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	
 	export class AgentReadiness {
 	    ready: boolean;
@@ -7,6 +63,7 @@ export namespace domain {
 	    builtinSkillLoaded: boolean;
 	    externalSkillCount: number;
 	    toolNames: string[];
+	    mcp: MCPStatus;
 	    issues?: string[];
 	
 	    static createFrom(source: any = {}) {
@@ -21,8 +78,27 @@ export namespace domain {
 	        this.builtinSkillLoaded = source["builtinSkillLoaded"];
 	        this.externalSkillCount = source["externalSkillCount"];
 	        this.toolNames = source["toolNames"];
+	        this.mcp = this.convertValues(source["mcp"], MCPStatus);
 	        this.issues = source["issues"];
 	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 	export class Attachment {
 	    filename: string;
@@ -657,4 +733,3 @@ export namespace tools {
 	}
 
 }
-
