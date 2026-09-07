@@ -72,6 +72,7 @@ type TeamStep = {
 
 type TeamStepResult = {
     stepId: string;
+    goal?: string;
     role: string;
     status: 'success' | 'partial' | 'failed' | 'skipped' | string;
     summary?: string;
@@ -888,6 +889,29 @@ function workerStepId(event: DiagnosticEvent): string {
     return String(payload.workerStepId ?? payload.metadata?.['team.worker_step_id'] ?? '');
 }
 
+function reasoningStageLabel(stage: unknown): string {
+    switch (String(stage ?? 'agent')) {
+        case 'planner': return 'Planner reasoning';
+        case 'reviewer': return 'Reviewer reasoning';
+        case 'worker-finalizer': return 'Worker finalizer reasoning';
+        case 'worker': return 'Sub-agent reasoning';
+        default: return 'Agent reasoning';
+    }
+}
+
+function ReasoningDisclosure({events, compact = false}: {events: DiagnosticEvent[]; compact?: boolean}) {
+    const tokenTotal = events.reduce((total, event) => total + Number(event.payload?.reasoningTokens ?? 0), 0);
+    const countLabel = events.length > 1 ? ` · ${events.length} steps` : '';
+    const tokenLabel = tokenTotal > 0 ? ` · ${tokenTotal} tokens` : '';
+    return <details className={`reasoning-disclosure ${compact ? 'compact' : ''}`}>
+        <summary>查看模型思考（调试）{countLabel}{tokenLabel}</summary>
+        <div>{events.map(event => <section key={event.id}>
+            {events.length > 1 && <small>{reasoningStageLabel(event.payload?.stage)}</small>}
+            <pre>{String(event.payload?.content ?? '')}</pre>
+        </section>)}</div>
+    </details>;
+}
+
 function TimelineFeed({events, onEvidence}: {events: DiagnosticEvent[]; onEvidence: (evidence: Evidence) => void}) {
     const teamPlanByRun = new Map<string, DiagnosticEvent>();
     const evidenceByID = new Map<string, Evidence>();
@@ -897,6 +921,7 @@ function TimelineFeed({events, onEvidence}: {events: DiagnosticEvent[]; onEviden
     }
 
     return <>{events.map(event => {
+        if (event.type === 'model.http.trace') return null;
         if (event.type === 'team.planned') {
             const runEvents = events.filter(candidate => candidate.runId === event.runId);
             return <TeamExecutionBoard key={event.id} planEvent={event} events={runEvents} evidenceByID={evidenceByID} onEvidence={onEvidence}/>;
@@ -940,6 +965,7 @@ function TeamExecutionBoard({planEvent, events, evidenceByID, onEvidence}: {
                     const result = finished?.payload as TeamStepResult | undefined;
                     const status = result?.status ?? (started ? 'running' : 'queued');
                     const activities = events.filter(event => workerStepId(event) === step.id && ['tool.started', 'tool.failed', 'evidence.captured'].includes(event.type));
+                    const reasoningEvents = events.filter(event => workerStepId(event) === step.id && event.type === 'agent.reasoning');
                     const evidenceIDs = Array.from(new Set([
                         ...(result?.evidenceIds ?? []),
                         ...activities.filter(event => event.type === 'evidence.captured').map(event => String(event.payload?.id ?? '')).filter(Boolean),
@@ -964,8 +990,10 @@ function TeamExecutionBoard({planEvent, events, evidenceByID, onEvidence}: {
                                 <span>{activities.filter(item => item.type === 'tool.started').length} tools</span>
                                 <span>{evidenceIDs.length} new evidence</span>
                                 {referencedEvidenceIDs.length > 0 && <span>{referencedEvidenceIDs.length} referenced</span>}
+                                {reasoningEvents.length > 0 && <span>{reasoningEvents.length} reasoning</span>}
                                 {elapsed !== undefined && <span>{formatDuration(elapsed)}</span>}
                             </div>
+                            {reasoningEvents.length > 0 && <ReasoningDisclosure events={reasoningEvents} compact/>}
                             {result?.summary && <details className="worker-result">
                                 <summary>查看交接结果</summary>
                                 <p>{result.summary}</p>
@@ -1006,8 +1034,9 @@ function formatDuration(milliseconds: number): string {
 function TimelineEvent({event, evidenceByID, onEvidence}: {event: DiagnosticEvent; evidenceByID: Map<string, Evidence>; onEvidence: (evidence: Evidence) => void}) {
     const payload = event.payload ?? {};
     const isEvidence = event.type === 'evidence.captured';
+    const isReasoning = event.type === 'agent.reasoning';
     const title: Record<string, string> = {
-        'run.started': 'User request', 'agent.message': 'Agent analysis', 'tool.proposed': 'Tool proposed',
+        'run.started': 'User request', 'agent.message': 'Agent analysis', 'agent.reasoning': reasoningStageLabel(payload.stage), 'tool.proposed': 'Tool proposed',
         'approval.required': 'Waiting for approval', 'approval.resolved': 'Approval resolved', 'tool.started': 'Tool executing', 'evidence.captured': 'Evidence captured',
         'tool.completed': 'Tool completed', 'tool.failed': 'Tool failed', 'team.planned': 'Team plan ready',
         'team.step.started': 'Evidence worker started', 'team.step.finished': 'Evidence worker finished',
@@ -1021,7 +1050,7 @@ function TimelineEvent({event, evidenceByID, onEvidence}: {event: DiagnosticEven
         <article className={`trace-event trace-${event.type.replace('.', '-')}`} onClick={() => isEvidence && onEvidence(payload as Evidence)}>
             <time>{new Date(event.timestamp).toLocaleTimeString([], {hour12: false})}</time>
             <span className="trace-node"/>
-            <div className="trace-content"><small>{event.type}</small><strong>{title[event.type] ?? event.type}</strong>{detail && (event.type === 'agent.message' ? <MarkdownMessage content={String(detail)} evidenceByID={evidenceByID} onEvidence={onEvidence}/> : <p>{detail}</p>)}{isEvidence && <button>Inspect raw evidence</button>}{expandable && <details className="trace-details"><summary>Show details</summary><pre>{JSON.stringify(payload, null, 2)}</pre></details>}</div>
+            <div className="trace-content"><small>{event.type}</small><strong>{title[event.type] ?? event.type}</strong>{isReasoning && <ReasoningDisclosure events={[event]}/>} {!isReasoning && detail && (event.type === 'agent.message' ? <MarkdownMessage content={String(detail)} evidenceByID={evidenceByID} onEvidence={onEvidence}/> : <p>{detail}</p>)}{isEvidence && <button>Inspect raw evidence</button>}{expandable && <details className="trace-details"><summary>Show details</summary><pre>{JSON.stringify(payload, null, 2)}</pre></details>}</div>
         </article>
     );
 }

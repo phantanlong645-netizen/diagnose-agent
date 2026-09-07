@@ -120,8 +120,9 @@ func NewRunner(registry *tools.Registry, policyEngine *policy.Engine, journal Ru
 	}
 }
 
-// Start 创建并启动一个新的诊断 run：规范化模式、持久化 run 与启动事件、
-// 记录目标事实和初始诊断计划，并清空跨 run 的只读证据已读记录。
+// Start 创建并启动一个新的诊断 run：规范化模式、持久化 run 与启动事件，
+// 并清空跨 run 的只读证据已读记录。尚未被模型处理的用户输入只属于
+// 当前 run，不得在这里覆盖上一轮已经建立的 confirmed facts / plan。
 func (r *Runner) Start(goal, profileID, conversationID string, mode domain.DiagnosticMode, images ...domain.ImageAttachment) (domain.Run, error) {
 	normalizedMode, err := domain.NormalizeDiagnosticMode(mode)
 	if err != nil {
@@ -145,26 +146,6 @@ func (r *Runner) Start(goal, profileID, conversationID string, mode domain.Diagn
 	r.mu.Lock()
 	r.runs[run.ID] = run
 	r.mu.Unlock()
-	if err := r.journal.SaveContextFact(domain.ContextFact{
-		ConversationID: run.ConversationID,
-		Key:            "goal",
-		Kind:           "goal",
-		Status:         "confirmed",
-		Content:        run.Goal,
-		Confidence:     1,
-		FirstSeen:      run.StartedAt,
-		LastSeen:       run.StartedAt,
-	}); err != nil {
-		return domain.Run{}, err
-	}
-	if err := r.journal.SavePlan(domain.DiagnosticPlan{
-		ConversationID: run.ConversationID,
-		Goal:           run.Goal,
-		NextAction:     "根据目标选择最小的只读证据源",
-		UpdatedAt:      run.StartedAt,
-	}); err != nil {
-		return domain.Run{}, err
-	}
 	r.emit(event)
 	return publicRun(run), nil
 }
@@ -230,6 +211,34 @@ func (r *Runner) Cancel(runID string) (domain.Run, error) {
 // PublishAgentMessage 发布一条 agent 的文本消息事件。
 func (r *Runner) PublishAgentMessage(runID, content string) error {
 	return r.publish(runID, domain.EventAgentMessage, map[string]string{"content": content})
+}
+
+// PublishAgentReasoning 发布模型明确返回且已经过调用方脱敏、截断的调试推理。
+// Team worker 的归属由宿主 context 注入，模型不能自行伪造 worker 标识。
+func (r *Runner) PublishAgentReasoning(ctx context.Context, runID, stage, content string, reasoningTokens int) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	payload := addTeamWorkerEventFields(ctx, map[string]any{
+		"stage":   strings.TrimSpace(stage),
+		"content": content,
+	})
+	if reasoningTokens > 0 {
+		payload["reasoningTokens"] = reasoningTokens
+	}
+	return r.publish(runID, domain.EventAgentReasoning, payload)
+}
+
+// RecordModelHTTPTrace 只把脱敏后的模型传输元数据写入 SQLite，不推送到 UI。
+// 观测失败必须由调用方按 best-effort 处理，不能改变真实模型调用的结果。
+func (r *Runner) RecordModelHTTPTrace(ctx context.Context, runID string, payload map[string]any) error {
+	run, exists := r.Run(runID)
+	if !exists {
+		return fmt.Errorf("run not found: %s", runID)
+	}
+	payload = addTeamWorkerEventFields(ctx, payload)
+	return r.journal.Append(newRunEvent(run, domain.EventModelHTTPTrace, payload))
 }
 
 // PublishTeamEvent 以父 run 为归属持久化一条结构化编排事件。

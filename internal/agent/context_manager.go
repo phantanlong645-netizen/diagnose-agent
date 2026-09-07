@@ -118,7 +118,7 @@ func (m *contextManager) BeforeModelRewriteState(ctx context.Context, state *adk
 	}
 	input = append(input, projected...)
 	// 4. 调用摘要模型并校验输出完整性。
-	summary, err := m.model.Generate(ctx, input)
+	summary, err := m.model.Generate(withModelTraceStage(ctx, "context-compaction"), input)
 	if err != nil {
 		return m.compactionFailure(ctx, state, fmt.Errorf("generate diagnostic context summary: %w", err))
 	}

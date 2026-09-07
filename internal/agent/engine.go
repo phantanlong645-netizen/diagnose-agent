@@ -18,15 +18,19 @@
 package agent
 
 import (
-	"context"       // 上下文传递与取消：用于模型调用超时、工具调用超时、诊断运行软停
+	"context" // 上下文传递与取消：用于模型调用超时、工具调用超时、诊断运行软停
+	"crypto/tls"
 	_ "embed"       // 用于 //go:embed 把 builtin/skill.md 编译进二进制，运行时不再依赖外部文件
 	"encoding/json" // JSON 序列化：对话历史 checkpoint、工具入参编码、证据结构化输出
 	"errors"        // errors.Join 用于 fail() 合并多个错误
 	"fmt"           // 错误包装与字符串拼接
+	"io"
 	"log/slog"
 
 	// 结构化记录模型调用失败与关键运行指标
-	"net/http"    // Eino OpenAI 客户端需要一个 *http.Client
+	"net/http"           // Eino OpenAI 客户端需要一个 *http.Client
+	"net/http/httptrace" // 记录 DNS/connect/TLS/首字节等脱敏传输阶段
+	"net/url"
 	"regexp"      // sanitizeModelMessages 用的敏感字段正则
 	"strings"     // 字符串处理：TrimSpace、Replace、Builder 等
 	"sync"        // sync.RWMutex：保护 Engine 的可热替换字段（model、settings、config）
@@ -94,10 +98,13 @@ const (
 	// 无法从 Base64 字节数准确推导视觉 token，按每个媒体块 1k token
 	// 计入触发预算，避免既完全漏算、又在首轮看图前因编码膨胀误触发摘要。
 	multimodalPartEstimateBytes = 4 * 1024
+	// 单条调试推理事件按 rune 限长，避免中文被截成无效 UTF-8。
+	reasoningDisplayMaxRunes = 4000
 )
 
 const systemInstruction = `You are an evidence-driven OLT diagnostic agent.
 You have a built-in OLT diagnostic workflow. External skill files are optional refinements, not a prerequisite for answering.
+The latest user message is the authoritative current request. Earlier conversation and diagnostic memory are background: use them when the latest message asks to continue, retry, or clarify prior work, but do not let an older goal override a new self-contained request.
 When you are about to call netconf_rpc or any non-trivial NBI write, FIRST open the <builtin-diagnostic-skill> block at the end of this system message and follow its filter shape, namespace, operation recipe, and stop rules verbatim. The skill is the authoritative RPC playbook; fall back to the navigation decision table in <project-orientation> only when the skill is silent on a specific RPC. Do not invent RPC shapes from general NETCONF conventions when the skill provides one.
 Write every user-facing agent message, progress update, explanation, and final diagnosis in Simplified Chinese by default. Preserve XML, JSON keys, source code, paths, protocol names, and device error text exactly; explain their meaning in Chinese. Only use another response language when the user explicitly requests it.
 Use the selected target profile and the available tools to investigate the user's goal.
@@ -217,6 +224,558 @@ type Engine struct {
 type TargetResolver interface {
 	Skills(profileID string) ([]string, bool)              // 返回该 profile 绑定的所有 skill 文本，未配置时 ok=false
 	Profile(profileID string) (domain.TargetProfile, bool) // 返回完整 profile，未找到时 ok=false
+}
+
+type modelTraceScopeContextKey struct{}
+type modelHTTPTraceStateContextKey struct{}
+
+// modelTraceScope 随单次 run 的 context 传播。sequence 在并行 worker 间共享，
+// stage/attempt 则通过复制 scope 覆盖，避免把可变的 current run 放进共享 Engine。
+type modelTraceScope struct {
+	runID         string
+	stage         string
+	logicalCallID string
+	attempt       int
+	sequence      *atomic.Int64
+}
+
+func withModelTraceRun(ctx context.Context, runID, stage string) context.Context {
+	return context.WithValue(ctx, modelTraceScopeContextKey{}, modelTraceScope{
+		runID:    strings.TrimSpace(runID),
+		stage:    strings.TrimSpace(stage),
+		attempt:  0,
+		sequence: &atomic.Int64{},
+	})
+}
+
+func withModelTraceStage(ctx context.Context, stage string) context.Context {
+	scope, ok := ctx.Value(modelTraceScopeContextKey{}).(modelTraceScope)
+	if !ok {
+		return ctx
+	}
+	scope.stage = strings.TrimSpace(stage)
+	scope.logicalCallID = ""
+	scope.attempt = 0
+	return context.WithValue(ctx, modelTraceScopeContextKey{}, scope)
+}
+
+func withModelTraceLogicalCall(ctx context.Context) context.Context {
+	scope, ok := ctx.Value(modelTraceScopeContextKey{}).(modelTraceScope)
+	if !ok {
+		return ctx
+	}
+	scope.logicalCallID = uuid.NewString()
+	return context.WithValue(ctx, modelTraceScopeContextKey{}, scope)
+}
+
+func withModelTraceAttempt(ctx context.Context, attempt int) context.Context {
+	scope, ok := ctx.Value(modelTraceScopeContextKey{}).(modelTraceScope)
+	if !ok {
+		return ctx
+	}
+	if attempt > 0 {
+		scope.attempt = attempt
+	}
+	return context.WithValue(ctx, modelTraceScopeContextKey{}, scope)
+}
+
+type modelTraceRecorder func(context.Context, string, map[string]any)
+
+// tracedChatModel 在 Eino 模型边界记录一次完整的非流式调用。它不改变错误，
+// 这样现有 errors.Is/errors.As 与重试策略仍然观察到 provider 的原始错误链。
+type tracedChatModel struct {
+	base        model.ToolCallingChatModel
+	modelName   string
+	toolCount   int
+	recordTrace modelTraceRecorder
+}
+
+func (m *tracedChatModel) Generate(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	scope, scoped := ctx.Value(modelTraceScopeContextKey{}).(modelTraceScope)
+	if !scoped || scope.runID == "" || m.recordTrace == nil {
+		return m.base.Generate(ctx, messages, opts...)
+	}
+	sequence := int64(0)
+	if scope.sequence != nil {
+		sequence = scope.sequence.Add(1)
+	}
+	traceID := uuid.NewString()
+	state := newModelHTTPTraceState()
+	traceContext := context.WithValue(ctx, modelHTTPTraceStateContextKey{}, state)
+	response, err := m.base.Generate(traceContext, messages, opts...)
+
+	payload := state.payload(err)
+	payload["traceId"] = traceID
+	if scope.logicalCallID != "" {
+		payload["logicalCallId"] = scope.logicalCallID
+	} else {
+		payload["logicalCallId"] = traceID
+	}
+	payload["stage"] = scope.stage
+	payload["sequence"] = sequence
+	if scope.attempt > 0 {
+		payload["attempt"] = scope.attempt
+	}
+	payload["model"] = m.modelName
+	payload["messageCount"] = len(messages)
+	payload["messageBytes"] = messageBlockBytes(messages)
+	payload["toolCount"] = m.toolCount
+	payload["stream"] = false
+	if response != nil {
+		payload["responseMessageBytes"] = modelMessageBytes(response)
+	}
+	m.recordTrace(ctx, scope.runID, payload)
+	return response, err
+}
+
+// 当前项目的 Agent/Team runner 都使用非流式 Generate。Stream 保持原样透传，
+// 避免在调用刚返回 reader、响应尚未消费完时误报一次“完成”事件。
+func (m *tracedChatModel) Stream(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return m.base.Stream(ctx, messages, opts...)
+}
+
+func (m *tracedChatModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	bound, err := m.base.WithTools(tools)
+	if err != nil {
+		return nil, err
+	}
+	return &tracedChatModel{
+		base:        bound,
+		modelName:   m.modelName,
+		toolCount:   len(tools),
+		recordTrace: m.recordTrace,
+	}, nil
+}
+
+type modelHTTPTraceState struct {
+	mu sync.Mutex
+
+	startedAt         time.Time
+	finishedAt        time.Time
+	dnsStartedAt      time.Time
+	dnsFinishedAt     time.Time
+	connectStartedAt  time.Time
+	connectFinishedAt time.Time
+	tlsStartedAt      time.Time
+	tlsFinishedAt     time.Time
+	wroteRequestAt    time.Time
+	firstByteAt       time.Time
+
+	method                string
+	scheme                string
+	host                  string
+	path                  string
+	requestBytes          int64
+	roundTrips            int
+	gotConnection         bool
+	connectionReused      bool
+	connectionWasIdle     bool
+	wroteRequest          bool
+	gotFirstByte          bool
+	headersReceived       bool
+	dnsFailed             bool
+	connectFailed         bool
+	tlsFailed             bool
+	writeFailed           bool
+	statusCode            int
+	protocol              string
+	responseContentLength int64
+	responseBytes         int64
+	responseUncompressed  bool
+	bodyReadFailed        bool
+	bodyReachedEOF        bool
+	bodyClosed            bool
+	bodyReadErrorKind     string
+	bodyReadErrorType     string
+	requestID             string
+	cloudflareRay         string
+	retryAfter            string
+}
+
+func newModelHTTPTraceState() *modelHTTPTraceState {
+	return &modelHTTPTraceState{startedAt: time.Now()}
+}
+
+func (s *modelHTTPTraceState) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) {
+			s.mu.Lock()
+			if s.dnsStartedAt.IsZero() {
+				s.dnsStartedAt = time.Now()
+			}
+			s.mu.Unlock()
+		},
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			s.mu.Lock()
+			s.dnsFinishedAt = time.Now()
+			s.dnsFailed = info.Err != nil
+			s.mu.Unlock()
+		},
+		ConnectStart: func(_, _ string) {
+			s.mu.Lock()
+			if s.connectStartedAt.IsZero() {
+				s.connectStartedAt = time.Now()
+			}
+			s.mu.Unlock()
+		},
+		ConnectDone: func(_, _ string, err error) {
+			s.mu.Lock()
+			s.connectFinishedAt = time.Now()
+			s.connectFailed = err != nil
+			s.mu.Unlock()
+		},
+		TLSHandshakeStart: func() {
+			s.mu.Lock()
+			s.tlsStartedAt = time.Now()
+			s.mu.Unlock()
+		},
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			s.mu.Lock()
+			s.tlsFinishedAt = time.Now()
+			s.tlsFailed = err != nil
+			s.mu.Unlock()
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			s.mu.Lock()
+			s.gotConnection = true
+			s.connectionReused = info.Reused
+			s.connectionWasIdle = info.WasIdle
+			s.mu.Unlock()
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			s.mu.Lock()
+			s.wroteRequestAt = time.Now()
+			s.wroteRequest = info.Err == nil
+			s.writeFailed = info.Err != nil
+			s.mu.Unlock()
+		},
+		GotFirstResponseByte: func() {
+			s.mu.Lock()
+			s.firstByteAt = time.Now()
+			s.gotFirstByte = true
+			s.mu.Unlock()
+		},
+	}
+}
+
+func (s *modelHTTPTraceState) markRequest(request *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.roundTrips++
+	s.method = request.Method
+	if request.URL != nil {
+		s.scheme = request.URL.Scheme
+		s.host = request.URL.Host
+		s.path = safeModelTracePath(request.URL)
+	}
+	s.requestBytes = request.ContentLength
+}
+
+func (s *modelHTTPTraceState) markResponse(response *http.Response) {
+	if response == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.headersReceived = true
+	s.statusCode = response.StatusCode
+	s.protocol = response.Proto
+	s.responseContentLength = response.ContentLength
+	s.responseUncompressed = response.Uncompressed
+	s.requestID = abbreviateContext(strings.TrimSpace(response.Header.Get("x-request-id")), 200)
+	s.cloudflareRay = abbreviateContext(strings.TrimSpace(response.Header.Get("cf-ray")), 200)
+	s.retryAfter = abbreviateContext(strings.TrimSpace(response.Header.Get("retry-after")), 200)
+}
+
+func (s *modelHTTPTraceState) addResponseBytes(count int, readErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.responseBytes += int64(count)
+	if errors.Is(readErr, io.EOF) {
+		s.bodyReachedEOF = true
+		return
+	}
+	if readErr != nil {
+		s.bodyReadFailed = true
+		if s.bodyReadErrorKind == "" {
+			s.bodyReadErrorKind = modelTraceReadErrorKind(readErr)
+			s.bodyReadErrorType = modelTraceErrorType(readErr)
+		}
+	}
+}
+
+func (s *modelHTTPTraceState) markBodyClosed(closeErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bodyClosed = true
+	if closeErr != nil && s.bodyReadErrorKind == "" {
+		s.bodyReadFailed = true
+		s.bodyReadErrorKind = modelTraceReadErrorKind(closeErr)
+		s.bodyReadErrorType = modelTraceErrorType(closeErr)
+	}
+}
+
+type modelTraceResponseBody struct {
+	io.ReadCloser
+	state *modelHTTPTraceState
+}
+
+func (b *modelTraceResponseBody) Read(buffer []byte) (int, error) {
+	count, err := b.ReadCloser.Read(buffer)
+	b.state.addResponseBytes(count, err)
+	return count, err
+}
+
+func (b *modelTraceResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.state.markBodyClosed(err)
+	return err
+}
+
+type modelTraceTransport struct {
+	base http.RoundTripper
+}
+
+func (t modelTraceTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	state, ok := request.Context().Value(modelHTTPTraceStateContextKey{}).(*modelHTTPTraceState)
+	if !ok || state == nil {
+		return base.RoundTrip(request)
+	}
+	state.markRequest(request)
+	traceContext := httptrace.WithClientTrace(request.Context(), state.clientTrace())
+	response, err := base.RoundTrip(request.WithContext(traceContext))
+	state.markResponse(response)
+	if response != nil && response.Body != nil {
+		response.Body = &modelTraceResponseBody{ReadCloser: response.Body, state: state}
+	}
+	return response, err
+}
+
+func (s *modelHTTPTraceState) payload(callErr error) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finishedAt = time.Now()
+
+	payload := map[string]any{
+		"method":                s.method,
+		"scheme":                s.scheme,
+		"host":                  s.host,
+		"path":                  s.path,
+		"requestBytes":          s.requestBytes,
+		"roundTrips":            s.roundTrips,
+		"gotConnection":         s.gotConnection,
+		"connectionReused":      s.connectionReused,
+		"connectionWasIdle":     s.connectionWasIdle,
+		"wroteRequest":          s.wroteRequest,
+		"gotFirstResponseByte":  s.gotFirstByte,
+		"headersReceived":       s.headersReceived,
+		"statusCode":            s.statusCode,
+		"protocol":              s.protocol,
+		"responseContentLength": s.responseContentLength,
+		"responseBytes":         s.responseBytes,
+		"responseUncompressed":  s.responseUncompressed,
+		"bodyReadFailed":        s.bodyReadFailed,
+		"bodyReachedEOF":        s.bodyReachedEOF,
+		"bodyClosed":            s.bodyClosed,
+		"modelOutcome":          "success",
+		"totalMs":               elapsedMilliseconds(s.startedAt, s.finishedAt),
+		"failurePhase":          modelTraceFailurePhase(s, callErr),
+		"errorKind":             modelTraceErrorKind(s, callErr),
+		"errorType":             modelTraceErrorType(callErr),
+	}
+	if callErr != nil {
+		payload["modelOutcome"] = "error"
+	}
+	if s.bodyReadErrorKind != "" {
+		payload["bodyReadErrorKind"] = s.bodyReadErrorKind
+		payload["bodyReadErrorType"] = s.bodyReadErrorType
+	}
+	if value := elapsedMilliseconds(s.dnsStartedAt, s.dnsFinishedAt); value > 0 {
+		payload["dnsMs"] = value
+	}
+	if value := elapsedMilliseconds(s.connectStartedAt, s.connectFinishedAt); value > 0 {
+		payload["connectMs"] = value
+	}
+	if value := elapsedMilliseconds(s.tlsStartedAt, s.tlsFinishedAt); value > 0 {
+		payload["tlsMs"] = value
+	}
+	if value := elapsedMilliseconds(s.wroteRequestAt, s.firstByteAt); value > 0 {
+		payload["firstByteMs"] = value
+	}
+	if s.requestID != "" {
+		payload["requestId"] = s.requestID
+	}
+	if s.cloudflareRay != "" {
+		payload["cloudflareRay"] = s.cloudflareRay
+	}
+	if s.retryAfter != "" {
+		payload["retryAfter"] = s.retryAfter
+	}
+	if safeError := safeModelTraceError(callErr); safeError != "" {
+		payload["error"] = safeError
+	}
+	return payload
+}
+
+func elapsedMilliseconds(start, end time.Time) int64 {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return 0
+	}
+	return end.Sub(start).Milliseconds()
+}
+
+func safeModelTracePath(target *url.URL) string {
+	if target == nil {
+		return ""
+	}
+	path := strings.ToLower(target.EscapedPath())
+	// BaseURL path segments are user-configurable and may themselves contain a
+	// credential. Persist only the known API operation suffix, never the prefix.
+	for _, suffix := range []string{"/chat/completions", "/responses", "/embeddings"} {
+		if strings.HasSuffix(path, suffix) {
+			return suffix
+		}
+	}
+	if path == "" || path == "/" {
+		return path
+	}
+	return "/[redacted]"
+}
+
+func modelTraceFailurePhase(state *modelHTTPTraceState, err error) string {
+	if err == nil {
+		if state.bodyReadFailed {
+			return "response_body"
+		}
+		return "complete"
+	}
+	if state.statusCode >= http.StatusBadRequest {
+		return "http_status"
+	}
+	if state.bodyReadFailed {
+		return "response_body"
+	}
+	if state.headersReceived {
+		return "response_decode"
+	}
+	if state.gotFirstByte {
+		return "response_headers"
+	}
+	if !state.gotConnection {
+		if state.tlsFailed {
+			return "tls"
+		}
+		if state.dnsFailed {
+			return "dns"
+		}
+		return "connect_or_write"
+	}
+	if state.writeFailed || !state.wroteRequest {
+		return "connect_or_write"
+	}
+	return "before_headers"
+}
+
+func modelTraceErrorKind(state *modelHTTPTraceState, err error) string {
+	if err == nil {
+		if state.bodyReadErrorKind != "" {
+			return state.bodyReadErrorKind
+		}
+		return "none"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline"
+	}
+	if state.statusCode >= http.StatusBadRequest {
+		return "http_status"
+	}
+	if state.bodyReadErrorKind != "" {
+		return state.bodyReadErrorKind
+	}
+	var syntaxError *json.SyntaxError
+	if errors.As(err, &syntaxError) {
+		return "invalid_json"
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return "unexpected_eof"
+	}
+	if errors.Is(err, io.EOF) {
+		if state.headersReceived && state.responseBytes == 0 {
+			return "empty_body"
+		}
+		return "eof"
+	}
+	return "other"
+}
+
+func modelTraceReadErrorKind(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, io.ErrClosedPipe):
+		return "closed_pipe"
+	default:
+		return "transport_read_error"
+	}
+}
+
+func modelTraceErrorType(err error) string {
+	if err == nil {
+		return ""
+	}
+	root := err
+	for {
+		next := errors.Unwrap(root)
+		if next == nil {
+			break
+		}
+		root = next
+	}
+	return fmt.Sprintf("%T", root)
+}
+
+func safeModelTraceError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled.Error()
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded.Error()
+	}
+	var syntaxError *json.SyntaxError
+	if errors.As(err, &syntaxError) {
+		return fmt.Sprintf("invalid JSON response at byte %d", syntaxError.Offset)
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return io.ErrUnexpectedEOF.Error()
+	}
+	if errors.Is(err, io.EOF) {
+		return io.EOF.Error()
+	}
+	var urlError *url.Error
+	if errors.As(err, &urlError) {
+		safeURL := ""
+		if parsed, parseErr := url.Parse(urlError.URL); parseErr == nil {
+			safeURL = parsed.Scheme + "://" + parsed.Host + safeModelTracePath(parsed)
+		}
+		return strings.TrimSpace(urlError.Op + " " + safeURL + ": " + modelTraceErrorKind(&modelHTTPTraceState{}, urlError.Err))
+	}
+	return modelTraceErrorType(err)
 }
 
 // conversationRecorder 负责把 Eino 跑出来的消息流转换成"可安全落库的对话历史"。
@@ -552,6 +1111,10 @@ func cloneMessages(messages []*schema.Message) ([]*schema.Message, error) {
 // 三个捕获组：字段名、分隔符、原始值；替换时保留前两组，把值改成 [REDACTED]。
 var modelSensitivePattern = regexp.MustCompile(`(?i)(authorization|password|passwd|api[_-]?key|secret|token|cookie)(["']?\s*[:=]\s*["']?)([^\s,;"']+)`)
 
+// modelAuthorizationCredentialPattern 在通用字段替换前吃掉 Bearer/Basic 后的凭据，
+// 避免只把认证方案名替换掉、却把真实 credential 留在调试 reasoning 中。
+var modelAuthorizationCredentialPattern = regexp.MustCompile(`(?i)(authorization["']?\s*[:=]\s*["']?(?:bearer|basic)\s+)([^\s,;"']+)`)
+
 // modelSensitiveXMLPattern 匹配 NETCONF/RPC 响应中 `<password>xxx</password>` 等 XML 元素。
 // 这里只覆盖常见 schema 字段名，真实业务里如果新增敏感字段名要扩展。
 var modelSensitiveXMLPattern = regexp.MustCompile(`(?is)(<(?:authorization|password|passwd|api[-_]?key|secret|token|cookie)\b[^>]*>).*?(</(?:authorization|password|passwd|api[-_]?key|secret|token|cookie)\s*>)`)
@@ -649,11 +1212,14 @@ func retainModelMessages(messages []*schema.Message) []*schema.Message {
 			}
 		}
 		for _, part := range message.AssistantGenMultiContent {
-			if part.Type == schema.ChatMessagePartTypeText {
+			switch part.Type {
+			case schema.ChatMessagePartTypeText:
 				if text := strings.TrimSpace(part.Text); text != "" {
 					textParts = append(textParts, text)
 				}
-			} else {
+			case schema.ChatMessagePartTypeReasoning:
+				// Reasoning 只作为脱敏调试事件展示，不进入跨轮 checkpoint。
+			default:
 				omittedParts++
 			}
 		}
@@ -661,6 +1227,7 @@ func retainModelMessages(messages []*schema.Message) []*schema.Message {
 			textParts = append(textParts, fmt.Sprintf("[%d multimodal attachment(s) were used for this turn; binary content is not retained.]", omittedParts))
 		}
 		message.Content = redactModelText(strings.Join(textParts, "\n\n"))
+		message.ReasoningContent = ""
 		message.MultiContent = nil
 		message.UserInputMultiContent = nil
 		message.AssistantGenMultiContent = nil
@@ -675,6 +1242,7 @@ func redactModelText(value string) string {
 	if value == "" {
 		return value
 	}
+	value = modelAuthorizationCredentialPattern.ReplaceAllString(value, "$1[REDACTED]")
 	value = modelSensitivePattern.ReplaceAllString(value, "$1$2[REDACTED]")
 	return modelSensitiveXMLPattern.ReplaceAllString(value, "$1[REDACTED]$2")
 }
@@ -763,21 +1331,33 @@ func (e *Engine) configure(ctx context.Context, settings domain.ModelSettings, v
 		return domain.ModelSettingsSummary{}, errors.New("model output reserve must be at least 256 and smaller than the context window")
 	}
 
-	// 7) 构造 Eino ChatModel 客户端。注意 Eino 要求非 nil HTTPClient（即便用默认也得传一个）。
-	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+	// 7) 构造 Eino ChatModel 客户端。Transport 只采集脱敏的连接阶段与字节计数，
+	// 不设置额外 timeout，也不读取 request/response 正文，保证观测不改变现场行为。
+	traceTransport := modelTraceTransport{base: http.DefaultTransport}
+	baseChatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		APIKey:     settings.APIKey,
 		BaseURL:    settings.BaseURL,
 		Model:      settings.Model,
-		HTTPClient: &http.Client{},
+		HTTPClient: &http.Client{Transport: traceTransport},
 	})
 	if err != nil {
 		return domain.ModelSettingsSummary{}, fmt.Errorf("configure chat model: %w", err)
+	}
+	recordTrace := func(traceContext context.Context, runID string, payload map[string]any) {
+		if traceErr := e.runner.RecordModelHTTPTrace(traceContext, runID, payload); traceErr != nil {
+			slog.Warn("persist model HTTP trace failed", "run_id", runID, "error", traceErr)
+		}
+	}
+	chatModel := &tracedChatModel{
+		base:        baseChatModel,
+		modelName:   settings.Model,
+		recordTrace: recordTrace,
 	}
 	manualDraftModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		APIKey:     settings.APIKey,
 		BaseURL:    settings.BaseURL,
 		Model:      settings.Model,
-		HTTPClient: &http.Client{},
+		HTTPClient: &http.Client{Transport: traceTransport},
 		ResponseFormat: &openai.ChatCompletionResponseFormat{
 			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
 		},
@@ -1019,6 +1599,7 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 	if strings.TrimSpace(run.ProfileID) == "" {
 		return e.fail(runID, errors.New("target profile is required"))
 	}
+	ctx = withModelTraceRun(ctx, runID, "agent")
 
 	// 2) 取出 ChatModel（必须在 configure 之后才能拿到）。
 	e.mu.RLock()
@@ -1032,25 +1613,18 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 		return e.fail(runID, err)
 	}
 
-	// 3) 加载历史上下文。空上下文（首次 run）时 exists=false 走 else 分支。
-	messages := make([]*schema.Message, 0)
-	contextJSON, exists, err := e.runner.Context(run.ConversationID)
+	// 3) 在任何模型调用前先持久化当前 user 边界。即使首次 Generate EOF，
+	// 下一轮也能按真实 role 顺序看到未完成的问题，而不是只剩一句 go on。
+	priorMessages, messages, contextExists, err := e.prepareRunConversation(run)
 	if err != nil {
 		return e.fail(runID, err)
 	}
-	if exists {
-		if err = json.Unmarshal(contextJSON, &messages); err != nil {
-			return e.fail(runID, fmt.Errorf("decode conversation context: %w", err))
-		}
-		// 早期 checkpoint 里可能残留密钥或形似凭据的 shell 片段，
-		// 先 sanitize 再进入模型，防止它们触达 provider。
-		messages = sanitizeModelMessages(messages)
+	if contextExists && len(priorMessages) > 0 {
 		// 提示用户"已恢复 N 条历史"，让他知道这是续聊而非新会话。
-		if err = e.runner.PublishAgentMessage(runID, fmt.Sprintf("Continuing this target conversation with %d retained context messages.", len(messages))); err != nil {
+		if err = e.runner.PublishAgentMessage(runID, fmt.Sprintf("已载入本目标会话中保留的 %d 条上下文消息。", len(priorMessages))); err != nil {
 			return e.fail(runID, err)
 		}
 	}
-	messages = append(messages, buildUserMessage(run))
 
 	// 5) 工具集：包含 NBI/NETCONF/文件 IO/搜索/写文件/shell。
 	agentTools, err := e.tools(runID, run.ProfileID)
@@ -1178,6 +1752,11 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 			}
 		}
 		if message != nil && message.Role == schema.Assistant {
+			if reasoning, reasoningTokens := displayableAssistantReasoning(message); reasoning != "" {
+				if err = e.runner.PublishAgentReasoning(ctx, runID, "agent", reasoning, reasoningTokens); err != nil {
+					return e.fail(runID, err)
+				}
+			}
 			// 剥离 <think>...</think> 块，只把对外可见内容推给前端。
 			if content := visibleAssistantContent(message.Content); content != "" {
 				if err = e.runner.PublishAgentMessage(runID, content); err != nil {
@@ -1198,7 +1777,7 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 	if len(finalMessages) == 0 {
 		return e.fail(runID, errors.New("Eino agent completed without a conversation state"))
 	}
-	contextJSON, err = json.Marshal(retainModelMessages(finalMessages))
+	contextJSON, err := json.Marshal(retainModelMessages(finalMessages))
 	if err != nil {
 		return e.fail(runID, fmt.Errorf("encode conversation context: %w", err))
 	}
@@ -1247,6 +1826,34 @@ func buildUserMessage(run domain.Run) *schema.Message {
 	}
 }
 
+// prepareRunConversation 返回调用前的历史与“历史 + 当前 user”消息，并先把后者
+// 以去媒体、去 reasoning、已脱敏的安全形式 checkpoint。返回给本轮模型的消息仍
+// 保留当前图片，避免为了持久化安全而让本轮模型看不到附件。
+func (e *Engine) prepareRunConversation(run domain.Run) (prior, current []*schema.Message, existed bool, err error) {
+	prior = make([]*schema.Message, 0)
+	contextJSON, existed, err := e.runner.Context(run.ConversationID)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if existed {
+		if err = json.Unmarshal(contextJSON, &prior); err != nil {
+			return nil, nil, false, fmt.Errorf("decode conversation context: %w", err)
+		}
+		prior = sanitizeModelMessages(prior)
+	}
+	current = make([]*schema.Message, 0, len(prior)+1)
+	current = append(current, prior...)
+	current = append(current, buildUserMessage(run))
+	checkpoint, marshalErr := json.Marshal(retainModelMessages(current))
+	if marshalErr != nil {
+		return nil, nil, false, fmt.Errorf("encode conversation checkpoint: %w", marshalErr)
+	}
+	if err = e.runner.SaveContext(run.ID, checkpoint); err != nil {
+		return nil, nil, false, fmt.Errorf("save conversation checkpoint: %w", err)
+	}
+	return prior, current, existed, nil
+}
+
 // diagnosticMemoryMessage 拉取本会话的诊断记忆（plan + facts），渲染成 system message。
 //
 // 诊断记忆以 pinned 形式注入：每次 GenModelInput 都会重新拉取，所以即便 summarization
@@ -1262,11 +1869,27 @@ func (e *Engine) diagnosticMemoryMessage(conversationID string) (*schema.Message
 	if err != nil {
 		return nil, err
 	}
+	// Older builds persisted every pending run.Goal as a confirmed fact at
+	// Runner.Start. Values such as "go on" therefore became misleading pinned
+	// memory after an EOF. The ordered conversation is now the source of truth;
+	// ignore only that exact legacy fact shape and retain all evidence facts.
+	facts = filterLegacyPendingGoalFacts(facts)
 	// 都没有就返回 nil（避免空 system message 干扰模型）。
 	if !planExists && len(facts) == 0 {
 		return nil, nil
 	}
 	return schema.SystemMessage(formatDiagnosticMemory(plan, planExists, facts)), nil
+}
+
+func filterLegacyPendingGoalFacts(facts []domain.ContextFact) []domain.ContextFact {
+	filtered := make([]domain.ContextFact, 0, len(facts))
+	for _, fact := range facts {
+		if strings.EqualFold(strings.TrimSpace(fact.Key), "goal") && strings.EqualFold(strings.TrimSpace(fact.Kind), "goal") {
+			continue
+		}
+		filtered = append(filtered, fact)
+	}
+	return filtered
 }
 
 // formatDiagnosticMemory 把 plan 和 facts 序列化成 "<diagnostic-memory>...</diagnostic-memory>" 文本块。
@@ -1278,7 +1901,7 @@ func formatDiagnosticMemory(plan domain.DiagnosticPlan, planExists bool, facts [
 	var builder strings.Builder
 	builder.WriteString("<diagnostic-memory>\n")
 	if planExists {
-		fmt.Fprintf(&builder, "goal: %s\n", abbreviateContext(plan.Goal, 2000))
+		fmt.Fprintf(&builder, "previous_plan_goal: %s\n", abbreviateContext(plan.Goal, 2000))
 		if plan.Target != "" {
 			fmt.Fprintf(&builder, "target: %s\n", abbreviateContext(plan.Target, 1000))
 		}
@@ -1422,7 +2045,20 @@ func stripMarkdownFrontmatter(markdown string) string {
 //
 // 所有 tool 都共享同样的"先入参编码 → runner.Execute → 错误转 observation"流水线。
 // 写入类工具（write_file / run_shell）由 runner.Execute 内部强制走 user approval 流程。
+// tools 是 Agent 的工具工厂：为当前 run 装配全部可用工具。
+//
+// 每个内置工具都遵循同一模板：
+//
+//	toolutils.InferTool(name, description, func(ctx, args) (observation, error))
+//	  ① description 是给模型的自然语言说明书（什么能做什么不能做、何时用）；
+//	  ② 回调把 Eino 推断出的类型化参数 json.Marshal 成 domain.ToolCall；
+//	  ③ 转交 e.executeTool → runner.Execute，出入证/审批/事件/evidence 全走统一通道；
+//	  ④ 返回 agentToolObservation（成功带 Evidence，失败带错误文本），模型能直接读懂。
+//
+// MCP 工具最后动态追加（schema 来自各 server 的 inputSchema）。
 func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
+	// 设备数据面工具：通过 Access Console NBI 发 HTTP 请求（只读方法免租约，
+	// 写方法需先 POST /northbound/auth/permissions 申请写租约并过人工审批）。
 	nbiTool, err := toolutils.InferTool("nbi_request",
 		"Send an HTTP request to the selected Access Console NBI. Paths must start with /northbound/ and must be verified by the bundled route catalog, the user, trusted documentation, or registered router source. For routes that require Access Console organization context, especially GET /northbound/onu/devices, include the confirmed org_code query parameter; do not guess it or append it to unrelated routes. For POST, PUT, PATCH, or DELETE other than the permission-acquisition call, obtain the NBI write lease first with POST /northbound/auth/permissions using the same JWT and a body such as {\"Duration\":\"600\"}; the lease is not a second token, must be approved, and must not be requested again while its returned expiry is active. If the lease is occupied (HTTP 403), report it without unchanged retries. GET, HEAD, and OPTIONS do not need the lease. Never infer /api or /api/v1 paths.",
 		func(ctx context.Context, input nbiArguments) (agentToolObservation, error) {
@@ -1446,6 +2082,8 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino NBI tool: %w", err)
 	}
 
+	// 日志取证工具：走专用鉴权下载 Access Console 业务日志 ZIP，
+	// 只返回按关键词/行数截断的脱敏片段（不是 OLT 文件系统阅读器，勿走 nbi_request）。
 	accessConsoleLogsTool, err := toolutils.InferTool("collect_access_console_logs",
 		"Download the current Access Console application business-log ZIP through the fixed authenticated GET /nms/v1/log/download route, then return only bounded redacted excerpts. This is not an OLT filesystem reader and must not be sent through nbi_request. Select likely files and provide focused keywords from the observed failure, such as a REST path, HTTP error, OLT IP, ONU serial number, AVC or service identifier. Current server bundles commonly include alarm.log, olt.log, ont.log, oss.log, syslog.log, chain.log, panic.log, panicN.log, and job.log. Call once after the failure facts are known; do not use it for unrestricted dumps or repeated polling.",
 		func(ctx context.Context, input accessConsoleLogsArguments) (agentToolObservation, error) {
@@ -1491,6 +2129,8 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino NETCONF tool: %w", err)
 	}
 
+	// 工作区只读工具：读工作区根内的 UTF-8 文本文件，支持按行区间聚焦读取，
+	// 避免把大文件整段塞进上下文。
 	readFileTool, err := toolutils.InferTool("read_file",
 		"Read a UTF-8 text file under an allowed workspace root. After search_files locates a large document section, use startLine and maxLines to read only that focused range.",
 		func(ctx context.Context, input fileReadArguments) (agentToolObservation, error) {
@@ -1523,6 +2163,7 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create Eino evidence-read tool: %w", err)
 	}
+	// 工作区发现工具：按文件名模式或文本内容定点找日志/YANG/文档/源码位置。
 	searchFilesTool, err := toolutils.InferTool("search_files",
 		"Find files by name pattern or search text in allowed workspaces. Use it only for targeted discovery of relevant logs, YANG modules, documentation, or source code. Do not search for skill files.",
 		func(ctx context.Context, input fileSearchArguments) (agentToolObservation, error) {
@@ -1538,6 +2179,8 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino file-search tool: %w", err)
 	}
 
+	// 工作区写入工具：写文件属破坏性副作用，description 强制标注"always requires approval"，
+	// runner.Execute 会因此走人工审批。
 	writeFileTool, err := toolutils.InferTool("write_file",
 		"Write a file under an allowed workspace root. This always requires user approval.",
 		func(ctx context.Context, input fileWriteArguments) (agentToolObservation, error) {
@@ -1551,6 +2194,8 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino file-write tool: %w", err)
 	}
 
+	// 本机执行工具：在允许的工作区根下跑 PowerShell/cmd/bash。
+	// 非沙箱、无防护，同样强制人工审批。
 	shellTool, err := toolutils.InferTool("run_shell",
 		"Run PowerShell, cmd, or bash starting under an allowed workspace root. The shell is not sandboxed and always requires user approval.",
 		func(ctx context.Context, input shellArguments) (agentToolObservation, error) {
@@ -1570,8 +2215,7 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino shell tool: %w", err)
 	}
 
-	// paicli-go 迁移能力：联网搜索。用于公网知识（产品文档、标准、已知问题、
-	// 版本说明等），本地 workspace 搜不到时才用，先窄查询后按需 web_fetch。
+	// 公网检索工具：查产品文档/标准/已知问题/版本说明等本地不可得的知识。
 	webSearchTool, err := toolutils.InferTool("web_search",
 		"Search the public web and return ranked text results with titles and URLs. Use it for product documentation, standards, known issues, release notes, or current facts that are not available in the configured workspaces or device evidence. Keep queries focused; use web_fetch to read a specific result page afterwards.",
 		func(ctx context.Context, input webSearchArguments) (agentToolObservation, error) {
@@ -1588,7 +2232,7 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino web-search tool: %w", err)
 	}
 
-	// paicli-go 迁移能力：网页抓取。只允许公网 http/https，返回抽取后的正文文本。
+	// 网页抓取工具：只放行公网 http/https，返回正文文本供模型精读 web_search 的命中页。
 	webFetchTool, err := toolutils.InferTool("web_fetch",
 		"Fetch one public http(s) page and return its readable text. Use it to read a documentation page or article referenced by a web_search result. Private addresses and non-http schemes are blocked.",
 		func(ctx context.Context, input webFetchArguments) (agentToolObservation, error) {
@@ -1605,7 +2249,7 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino web-fetch tool: %w", err)
 	}
 
-	// paicli-go 迁移能力：RAG 语义代码检索。search_files 找不到精确文本时的兜底，
+	// ：RAG 语义代码检索。search_files 找不到精确文本时的兜底，
 	// 符号级索引（Go AST 函数分块）+ TF 余弦，返回文件/行号/符号/预览。
 	searchCodeTool, err := toolutils.InferTool("search_code",
 		"Semantic code search over the workspace code index. Use it as the fallback when search_files cannot locate an implementation because the exact symbol or text is unknown, or for natural-language questions such as where a feature is implemented. Returns file, line range, symbol, and preview. Retry once with rebuild=true only after the workspace changed significantly.",
@@ -1625,7 +2269,7 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 		return nil, fmt.Errorf("create Eino code-search tool: %w", err)
 	}
 
-	// paicli-go 迁移能力：长期记忆。memory_save 只维护本地记忆、不触碰目标设备，
+	// ：长期记忆。memory_save 只维护本地记忆、不触碰目标设备，
 	// 由 policy 自动放行；memory_search 只读检索 global + 当前 profile 的持久化事实。
 	memorySaveTool, err := toolutils.InferTool("memory_save",
 		"Persist one durable fact to long-term cross-conversation memory for later sessions. Scope to the current profile by default, or set scope=global for target-independent facts.",
@@ -1643,6 +2287,7 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create Eino memory-save tool: %w", err)
 	}
+	// 长期记忆检索工具：按关键词查历史会话沉淀的事实（当前 profile + global）。
 	memorySearchTool, err := toolutils.InferTool("memory_search",
 		"Search long-term cross-conversation memory by keyword. Returns recent matching facts from the current profile plus global facts recorded by earlier sessions.",
 		func(ctx context.Context, input memorySearchArguments) (agentToolObservation, error) {
@@ -1665,6 +2310,7 @@ func (e *Engine) tools(runID, profileID string) ([]einotool.BaseTool, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 静态内置工具 + 动态 MCP 工具合并成最终工具集交给 Agent。
 	staticTools := []einotool.BaseTool{nbiTool, accessConsoleLogsTool, netconfTool, searchFilesTool, readFileTool, readEvidenceTool, writeFileTool, shellTool, webSearchTool, webFetchTool, searchCodeTool, memorySaveTool, memorySearchTool}
 	return append(staticTools, mcpTools...), nil
 }
@@ -1682,12 +2328,23 @@ func (t *mcpEinoTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 	return t.info, nil
 }
 
+// InvokableRun 是 Eino 工具接口规定的调用入口。
+//
+// 参数来源：模型（或 MCP 子进程）传来一段 JSON 字符串 argumentsInJSON。
+// 返回要求：Eino 工具接口契约固定为 (string, error)，不能返回结构体。
+//
+// 整体流程：把 JSON 字符串塞进 ToolCall → 走统一的 executeTool 通道
+//
+//	→ 拿到 observation（agentToolObservation） → JSON 编码成字符串回给模型。
 func (t *mcpEinoTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...einotool.Option) (string, error) {
+	// 把 Eino 给的参数包成统一的 ToolCall 结构；CallID 由本端现编，保证唯一即可。
 	observation := t.engine.executeTool(ctx, t.runID, domain.ToolCall{
 		ID:        uuid.NewString(),
 		Name:      t.name,
 		Arguments: json.RawMessage(argumentsInJSON),
 	})
+	// 序列化失败时返回空串 + 错误，让 Eino 把这条 tool result 标记为失败。
+	// 成功时编码为字符串，Eino 会把它作为 tool 角色的 Content 喂回模型。
 	result, err := json.Marshal(observation)
 	if err != nil {
 		return "", err
@@ -2109,7 +2766,66 @@ type fileSearchArguments struct {
 var (
 	completeThinkBlock = regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think>\s*`)
 	unclosedThinkBlock = regexp.MustCompile(`(?is)<think\b[^>]*>.*$`)
+	completeThinkText  = regexp.MustCompile(`(?is)<think\b[^>]*>(.*?)</think>`)
+	unclosedThinkText  = regexp.MustCompile(`(?is)<think\b[^>]*>(.*)$`)
 )
+
+// displayableAssistantReasoning 收集 provider 明确暴露的 reasoning 字段与
+// 兼容模型写入 Content 的 <think> 块。结果在发布前统一去重、脱敏并按 rune 截断。
+func displayableAssistantReasoning(message *schema.Message) (string, int) {
+	if message == nil || message.Role != schema.Assistant {
+		return "", 0
+	}
+	parts := make([]string, 0, 4)
+	if content := strings.TrimSpace(message.ReasoningContent); content != "" {
+		parts = append(parts, content)
+	}
+	for _, part := range message.AssistantGenMultiContent {
+		if part.Type == schema.ChatMessagePartTypeReasoning && part.Reasoning != nil {
+			if content := strings.TrimSpace(part.Reasoning.Text); content != "" {
+				parts = append(parts, content)
+			}
+		}
+	}
+	for _, match := range completeThinkText.FindAllStringSubmatch(message.Content, -1) {
+		if len(match) > 1 {
+			if content := strings.TrimSpace(match[1]); content != "" {
+				parts = append(parts, content)
+			}
+		}
+	}
+	remaining := completeThinkBlock.ReplaceAllString(message.Content, "")
+	if match := unclosedThinkText.FindStringSubmatch(remaining); len(match) > 1 {
+		if content := strings.TrimSpace(match[1]); content != "" {
+			parts = append(parts, content)
+		}
+	}
+
+	parts = uniqueStrings(parts)
+	content := abbreviateRunes(redactModelText(strings.Join(parts, "\n\n")), reasoningDisplayMaxRunes)
+	tokens := 0
+	if message.ResponseMeta != nil && message.ResponseMeta.Usage != nil {
+		tokens = message.ResponseMeta.Usage.CompletionTokensDetails.ReasoningTokens
+	}
+	return content, tokens
+}
+
+func abbreviateRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	if limit <= 0 {
+		return ""
+	}
+	marker := []rune("...[truncated]...")
+	if limit <= len(marker) {
+		return string(runes[:limit])
+	}
+	head := (limit - len(marker)) / 2
+	tail := limit - len(marker) - head
+	return string(runes[:head]) + string(marker) + string(runes[len(runes)-tail:])
+}
 
 // visibleAssistantContent 把模型响应里的 <think>...</think> 思维链剥掉，只保留对外可见的正文。
 //

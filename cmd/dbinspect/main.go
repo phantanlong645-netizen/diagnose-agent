@@ -195,6 +195,65 @@ func printPayload(typ string, payload []byte) {
 			fmt.Printf("  message: %s\n", clip(m.Message, 600))
 			return
 		}
+	case "model.http.trace":
+		var p struct {
+			TraceID              string `json:"traceId"`
+			LogicalCallID        string `json:"logicalCallId"`
+			Stage                string `json:"stage"`
+			WorkerStepID         string `json:"workerStepId"`
+			WorkerRole           string `json:"workerRole"`
+			Sequence             int64  `json:"sequence"`
+			Attempt              int    `json:"attempt"`
+			Model                string `json:"model"`
+			MessageCount         int    `json:"messageCount"`
+			MessageBytes         int    `json:"messageBytes"`
+			ToolCount            int    `json:"toolCount"`
+			Method               string `json:"method"`
+			Scheme               string `json:"scheme"`
+			Host                 string `json:"host"`
+			Path                 string `json:"path"`
+			RoundTrips           int    `json:"roundTrips"`
+			GotConnection        bool   `json:"gotConnection"`
+			ConnectionReused     bool   `json:"connectionReused"`
+			WroteRequest         bool   `json:"wroteRequest"`
+			FailurePhase         string `json:"failurePhase"`
+			ErrorKind            string `json:"errorKind"`
+			Error                string `json:"error"`
+			StatusCode           int    `json:"statusCode"`
+			TotalMS              int64  `json:"totalMs"`
+			FirstByteMS          int64  `json:"firstByteMs"`
+			ResponseBytes        int64  `json:"responseBytes"`
+			BodyReadFailed       bool   `json:"bodyReadFailed"`
+			BodyReachedEOF       bool   `json:"bodyReachedEOF"`
+			BodyReadErrorKind    string `json:"bodyReadErrorKind"`
+			HeadersReceived      bool   `json:"headersReceived"`
+			GotFirstResponseByte bool   `json:"gotFirstResponseByte"`
+			RequestID            string `json:"requestId"`
+			CloudflareRay        string `json:"cloudflareRay"`
+		}
+		if json.Unmarshal(payload, &p) == nil {
+			fmt.Printf("  trace: %s  call: %s  stage: %s  sequence: %d", p.TraceID, p.LogicalCallID, p.Stage, p.Sequence)
+			if p.Attempt > 0 {
+				fmt.Printf("  attempt: %d", p.Attempt)
+			}
+			fmt.Printf("  model: %s\n", p.Model)
+			if p.WorkerStepID != "" {
+				fmt.Printf("  worker: %s (%s)\n", p.WorkerStepID, p.WorkerRole)
+			}
+			fmt.Printf("  HTTP: %s %s://%s%s  roundTrips=%d connected=%v reused=%v wrote=%v\n", p.Method, p.Scheme, p.Host, p.Path, p.RoundTrips, p.GotConnection, p.ConnectionReused, p.WroteRequest)
+			fmt.Printf("  request: messages=%d bytes=%d tools=%d  response: status=%d headers=%v firstByte=%v bytes=%d\n", p.MessageCount, p.MessageBytes, p.ToolCount, p.StatusCode, p.HeadersReceived, p.GotFirstResponseByte, p.ResponseBytes)
+			if p.BodyReadFailed || p.BodyReadErrorKind != "" {
+				fmt.Printf("  body: failed=%v reachedEOF=%v errorKind=%s\n", p.BodyReadFailed, p.BodyReachedEOF, p.BodyReadErrorKind)
+			}
+			fmt.Printf("  timing: total=%dms firstByte=%dms  outcome: %s/%s\n", p.TotalMS, p.FirstByteMS, p.FailurePhase, p.ErrorKind)
+			if p.RequestID != "" || p.CloudflareRay != "" {
+				fmt.Printf("  requestId: %s  cfRay: %s\n", p.RequestID, p.CloudflareRay)
+			}
+			if p.Error != "" {
+				fmt.Printf("  error: %s\n", p.Error)
+			}
+			return
+		}
 	case "tool.proposed":
 		var p struct {
 			CallID    string         `json:"callId"`

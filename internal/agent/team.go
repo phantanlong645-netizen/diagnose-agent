@@ -36,6 +36,10 @@ const (
 	teamWorkerReportMax = 12000
 	// teamSourceMaxSearch source 步骤允许的最大搜索次数。
 	teamSourceMaxSearch = 4
+	// teamModelMaxAttempts bounds direct Planner/Reviewer/finalizer generations.
+	teamModelMaxAttempts = 3
+	// teamModelRetryBaseDelay is doubled between retry attempts.
+	teamModelRetryBaseDelay = 500 * time.Millisecond
 
 	// 步骤状态取值：成功 / 部分完成 / 失败 / 被跳过。
 	teamStepSuccess = "success"
@@ -43,6 +47,52 @@ const (
 	teamStepFailed  = "failed"
 	teamStepSkipped = "skipped"
 )
+
+type teamModelRetryCallback func(context.Context, int, int, error) error
+
+// generateTeamModel applies the same transient-failure policy to direct Team
+// model calls that Eino's Agent runner already applies to standard workers.
+// Parsing stays outside this helper so invalid model output is never retried.
+func generateTeamModel(ctx context.Context, chatModel model.ToolCallingChatModel, messages []*schema.Message, onRetry teamModelRetryCallback) (*schema.Message, error) {
+	ctx = withModelTraceLogicalCall(ctx)
+	var lastErr error
+	for attempt := 1; attempt <= teamModelMaxAttempts; attempt++ {
+		response, err := chatModel.Generate(withModelTraceAttempt(ctx, attempt), messages)
+		if err == nil && response != nil {
+			return response, nil
+		}
+		if err == nil {
+			err = errors.New("provider returned no message")
+		}
+		lastErr = err
+		if attempt == teamModelMaxAttempts || !modelErrorIsRetryable(err) {
+			break
+		}
+		nextAttempt := attempt + 1
+		if onRetry != nil {
+			if callbackErr := onRetry(ctx, nextAttempt, teamModelMaxAttempts, explainModelProviderError(err)); callbackErr != nil {
+				return nil, fmt.Errorf("publish model retry: %w", callbackErr)
+			}
+		}
+		delay := teamModelRetryBaseDelay * time.Duration(1<<(attempt-1))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if modelErrorIsRetryable(lastErr) {
+		return nil, fmt.Errorf("model generation failed after %d attempts: %w", teamModelMaxAttempts, lastErr)
+	}
+	return nil, lastErr
+}
 
 // validTeamStepID 校验 Planner 生成的步骤 ID 格式（字母开头，最多 64 字符）。
 var validTeamStepID = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
@@ -81,6 +131,7 @@ type TeamFact struct {
 // 大段原始负载仍保留在 Evidence 存储中。
 type TeamStepResult struct {
 	StepID                string     `json:"stepId"`
+	Goal                  string     `json:"goal"`
 	Role                  string     `json:"role"`
 	Status                string     `json:"status"`
 	Summary               string     `json:"summary"`
@@ -226,6 +277,7 @@ func (t *Team) Run(ctx context.Context, goal string) (TeamRunResult, error) {
 		if dagResult.Err != nil && !resultExists {
 			result := TeamStepResult{
 				StepID:  step.ID,
+				Goal:    step.Goal,
 				Role:    step.Role,
 				Status:  teamStepFailed,
 				Summary: "Worker could not start or report its result.",
@@ -246,6 +298,7 @@ func (t *Team) Run(ctx context.Context, goal string) (TeamRunResult, error) {
 		}
 		result := TeamStepResult{
 			StepID:   step.ID,
+			Goal:     step.Goal,
 			Role:     step.Role,
 			Status:   teamStepSkipped,
 			Summary:  fmt.Sprintf("Skipped because dependency %s failed.", dagResult.SkipFrom),
@@ -270,6 +323,7 @@ func (t *Team) Run(ctx context.Context, goal string) (TeamRunResult, error) {
 
 func normalizeTeamStepResult(step TeamStep, result TeamStepResult, workErr error) TeamStepResult {
 	result.StepID = step.ID
+	result.Goal = step.Goal
 	result.Role = step.Role
 	result.Summary = strings.TrimSpace(result.Summary)
 	result.EvidenceIDs = uniqueStrings(result.EvidenceIDs)
@@ -296,7 +350,11 @@ func normalizeTeamStepResult(step TeamStep, result TeamStepResult, workErr error
 
 // LLMPlanner 用 ChatModel 把诊断目标规划成取证步骤 DAG。
 type LLMPlanner struct {
-	Model model.ToolCallingChatModel
+	Model       model.ToolCallingChatModel
+	History     []*schema.Message
+	Memory      *schema.Message
+	OnReasoning func(context.Context, string, int) error
+	OnRetry     teamModelRetryCallback
 }
 
 // teamPlannerPrompt 是规划阶段发给模型的系统提示词（保持英文）。
@@ -319,6 +377,8 @@ Rules:
 - Create a source step only to explain a specific observed status/error, discover an unknown route/RPC/field, or verify a concrete implementation mismatch. Do not ask it to inspect all YANG, code, and design documents for general background.
 - sourceSearch is allowed only for source steps. Supply exact literals/symbols/routes and likely owner paths whenever they are already known. maxSearches must be between 1 and 4.
 - When the source lookup term must come from a live platform/device response, set runtimeDerived=true and make the source step depend on that live step. Otherwise source investigation may run in parallel.
+- The final user message is the authoritative current request. Use earlier history only when it explicitly continues, retries, or clarifies unfinished work; never let an older goal override a new self-contained request.
+- Every step goal must be self-contained. Workers do not receive conversation history, so copy the exact target, identifiers, endpoint, error signature, and requested comparison that the worker needs into its own goal.
 - Do not create a final-answer step; a separate Reviewer always synthesizes the result.
 - Prefer read-only evidence. Never plan configuration changes or shell commands.
 - Use web only when the requested fact cannot be established from the target or configured workspaces.
@@ -328,14 +388,22 @@ func (p LLMPlanner) Plan(ctx context.Context, goal string) ([]TeamStep, error) {
 	if p.Model == nil {
 		return nil, errors.New("planner model is not configured")
 	}
-	response, err := p.Model.Generate(ctx, []*schema.Message{
-		schema.SystemMessage(teamPlannerPrompt),
-		schema.UserMessage(goal),
-	})
+	ctx = withModelTraceStage(ctx, "planner")
+	history := plannerConversationHistory(p.History)
+	history = append(history, schema.UserMessage(goal))
+	response, err := generateTeamModel(ctx, p.Model, modelMessagesWithLeadingSystem(
+		[]*schema.Message{schema.SystemMessage(teamPlannerPrompt), p.Memory},
+		history,
+	), p.OnRetry)
 	if err != nil {
 		return nil, err
 	}
-	steps, err := parseTeamSteps(response.Content)
+	if reasoning, tokens := displayableAssistantReasoning(response); reasoning != "" && p.OnReasoning != nil {
+		if err = p.OnReasoning(ctx, reasoning, tokens); err != nil {
+			return nil, fmt.Errorf("publish planner reasoning: %w", err)
+		}
+	}
+	steps, err := parseTeamSteps(visibleAssistantContent(response.Content))
 	if err != nil {
 		return nil, fmt.Errorf("planner returned invalid plan: %w", err)
 	}
@@ -343,15 +411,45 @@ func (p LLMPlanner) Plan(ctx context.Context, goal string) ([]TeamStep, error) {
 	return wireTeamSourceDependencies(steps), nil
 }
 
+// plannerConversationHistory 只给无工具 Planner 最近的 user 与最终 assistant
+// 文本。旧 tool/tool-call 对仍保留在 SQLite 证据链中，但不进入规划请求，避免
+// 协议残片与大工具结果挤占上下文。
+func plannerConversationHistory(messages []*schema.Message) []*schema.Message {
+	const maxMessages = 12
+	const maxBytes = 16 * 1024
+	candidates := make([]*schema.Message, 0, len(messages))
+	for _, message := range retainModelMessages(messages) {
+		if message == nil {
+			continue
+		}
+		switch message.Role {
+		case schema.User:
+			candidates = append(candidates, message)
+		case schema.Assistant:
+			if len(message.ToolCalls) == 0 && strings.TrimSpace(message.Content) != "" {
+				candidates = append(candidates, message)
+			}
+		}
+	}
+	start := len(candidates)
+	total := 0
+	for start > 0 && len(candidates)-start < maxMessages {
+		size := modelMessageBytes(candidates[start-1])
+		if total > 0 && total+size > maxBytes {
+			break
+		}
+		total += size
+		start--
+	}
+	return candidates[start:]
+}
+
 // wireTeamLocatorDependencies provides a deterministic safety net around the
 // model-authored DAG. A serial/MAC alone is not enough to issue a narrow
 // per-ONT NETCONF query, so live device steps wait for the first independent
 // platform step to resolve the locator. The Planner still decides whether a
 // platform lookup is needed; the host owns the data dependency once it exists.
-func wireTeamLocatorDependencies(goal string, steps []TeamStep) []TeamStep {
-	if explicitDeviceLocator.MatchString(goal) {
-		return steps
-	}
+func wireTeamLocatorDependencies(_ string, steps []TeamStep) []TeamStep {
 	locatorID := ""
 	for _, step := range steps {
 		if step.Role == "platform" && len(step.DependsOn) == 0 {
@@ -364,6 +462,12 @@ func wireTeamLocatorDependencies(goal string, steps []TeamStep) []TeamStep {
 	}
 	for index := range steps {
 		if steps[index].Role != "device" || steps[index].ID == locatorID {
+			continue
+		}
+		// A continuation such as "go on" may carry the concrete LT/PON only in
+		// the Planner's self-contained device goal. Inspect that host-validated
+		// current plan instead of forcing the device behind an unrelated lookup.
+		if explicitDeviceLocator.MatchString(steps[index].Goal) {
 			continue
 		}
 		if teamStepTransitivelyDependsOn(steps, locatorID, steps[index].ID) {
@@ -439,7 +543,9 @@ func teamStepTransitivelyDependsOn(steps []TeamStep, startID, targetID string) b
 }
 
 type LLMReviewer struct {
-	Model model.ToolCallingChatModel
+	Model       model.ToolCallingChatModel
+	OnReasoning func(context.Context, string, int) error
+	OnRetry     teamModelRetryCallback
 }
 
 const teamReviewerPrompt = `You are the Reviewer for an OLT diagnostic supervisor/worker run.
@@ -447,6 +553,7 @@ Produce one evidence-grounded final answer in Simplified Chinese from the struct
 Distinguish observed facts from inference. Cite evidence IDs next to important facts. Reconcile contradictions explicitly.
 Cite each evidence ID using Markdown inline-code formatting so the UI can resolve it to the persisted evidence item.
 The host-populated evidenceIds and referencedEvidenceIds arrays are authoritative. evidenceIds are newly captured by that worker; referencedEvidenceIds are host-validated references to dependency evidence. Never trust an ID mentioned only inside a worker summary when it is absent from both arrays.
+Each worker result also contains a host-populated goal copied from the current Planner step. When the top-level goal is a short continuation, use these self-contained worker goals to recover the exact investigation scope.
 If a worker is partial, failed, or skipped, state the exact remaining evidence gap without inventing a result.
 Do not claim a diagnosis is certain when the available evidence only supports a hypothesis.`
 
@@ -459,14 +566,20 @@ func (r LLMReviewer) Review(ctx context.Context, goal string, outputs map[string
 	if err != nil {
 		return "", fmt.Errorf("encode worker outputs for review: %w", err)
 	}
-	response, err := r.Model.Generate(ctx, []*schema.Message{
+	ctx = withModelTraceStage(ctx, "reviewer")
+	response, err := generateTeamModel(ctx, r.Model, []*schema.Message{
 		schema.SystemMessage(teamReviewerPrompt),
 		schema.UserMessage(fmt.Sprintf("goal: %s\nworker results:\n%s", goal, payload)),
-	})
+	}, r.OnRetry)
 	if err != nil {
 		return "", err
 	}
-	return response.Content, nil
+	if reasoning, tokens := displayableAssistantReasoning(response); reasoning != "" && r.OnReasoning != nil {
+		if err = r.OnReasoning(ctx, reasoning, tokens); err != nil {
+			return "", fmt.Errorf("publish reviewer reasoning: %w", err)
+		}
+	}
+	return visibleAssistantContent(response.Content), nil
 }
 
 func parseTeamSteps(content string) ([]TeamStep, error) {
@@ -749,6 +862,7 @@ func (e *Engine) RunTeam(ctx context.Context, runID string) error {
 	if strings.TrimSpace(run.ProfileID) == "" {
 		return e.fail(runID, errors.New("target profile is required"))
 	}
+	ctx = withModelTraceRun(ctx, runID, "team")
 	e.mu.RLock()
 	chatModel := e.model
 	e.mu.RUnlock()
@@ -758,16 +872,41 @@ func (e *Engine) RunTeam(ctx context.Context, runID string) error {
 	if err := e.runner.PublishAgentMessage(runID, "已启动深度诊断：Planner 将拆分只读取证任务，独立子 Agent 会通过 DAG 并行执行，最终由 Reviewer 汇总证据。"); err != nil {
 		return e.fail(runID, err)
 	}
-	teamGoal := run.Goal
+	priorMessages, conversationMessages, contextExists, err := e.prepareRunConversation(run)
+	if err != nil {
+		return e.fail(runID, err)
+	}
+	if contextExists && len(priorMessages) > 0 {
+		if err = e.runner.PublishAgentMessage(runID, fmt.Sprintf("已载入本目标会话中保留的 %d 条上下文消息。", len(priorMessages))); err != nil {
+			return e.fail(runID, err)
+		}
+	}
 	memoryMessage, err := e.diagnosticMemoryMessage(run.ConversationID)
 	if err != nil {
 		return e.fail(runID, err)
 	}
-	if memoryMessage != nil && strings.TrimSpace(memoryMessage.Content) != "" {
-		teamGoal += "\n\nExisting verified diagnostic memory:\n" + memoryMessage.Content
-	}
 
 	team := e.Team(&engineTeamWorker{engine: e, run: run, model: chatModel})
+	team.Planner = LLMPlanner{
+		Model:   chatModel,
+		History: priorMessages,
+		Memory:  memoryMessage,
+		OnReasoning: func(reasoningContext context.Context, content string, tokens int) error {
+			return e.runner.PublishAgentReasoning(reasoningContext, runID, "planner", content, tokens)
+		},
+		OnRetry: func(_ context.Context, attempt, maxAttempts int, retryErr error) error {
+			return e.runner.PublishAgentMessage(runID, fmt.Sprintf("Planner 模型连接中断，正在进行第 %d/%d 次尝试：%v", attempt, maxAttempts, retryErr))
+		},
+	}
+	team.Reviewer = LLMReviewer{
+		Model: chatModel,
+		OnReasoning: func(reasoningContext context.Context, content string, tokens int) error {
+			return e.runner.PublishAgentReasoning(reasoningContext, runID, "reviewer", content, tokens)
+		},
+		OnRetry: func(_ context.Context, attempt, maxAttempts int, retryErr error) error {
+			return e.runner.PublishAgentMessage(runID, fmt.Sprintf("Reviewer 模型连接中断，正在进行第 %d/%d 次尝试：%v", attempt, maxAttempts, retryErr))
+		},
+	}
 	team.OnPlanned = func(steps []TeamStep) error {
 		if err := e.runner.PublishTeamEvent(runID, domain.EventTeamPlanned, map[string]any{
 			"summary": fmt.Sprintf("Planner created %d investigation steps", len(steps)),
@@ -781,7 +920,7 @@ func (e *Engine) RunTeam(ctx context.Context, runID string) error {
 		}
 		return e.runner.SavePlan(domain.DiagnosticPlan{
 			ConversationID:      run.ConversationID,
-			Goal:                run.Goal,
+			Goal:                teamPlanMemoryGoal(run.Goal, steps),
 			Target:              run.ProfileID,
 			UnresolvedQuestions: questions,
 			NextAction:          "并行执行当前无依赖的只读取证子任务",
@@ -799,7 +938,7 @@ func (e *Engine) RunTeam(ctx context.Context, runID string) error {
 		return e.runner.PublishTeamEvent(runID, domain.EventTeamStepFinished, result)
 	}
 
-	teamResult, err := team.Run(ctx, teamGoal)
+	teamResult, err := team.Run(ctx, run.Goal)
 	if err != nil {
 		return e.fail(runID, err)
 	}
@@ -813,7 +952,7 @@ func (e *Engine) RunTeam(ctx context.Context, runID string) error {
 	completed, unresolved := summarizeTeamPlan(teamResult)
 	if err = e.runner.SavePlan(domain.DiagnosticPlan{
 		ConversationID:      run.ConversationID,
-		Goal:                run.Goal,
+		Goal:                teamPlanMemoryGoal(run.Goal, teamResult.Steps),
 		Target:              run.ProfileID,
 		CompletedChecks:     completed,
 		UnresolvedQuestions: unresolved,
@@ -823,24 +962,30 @@ func (e *Engine) RunTeam(ctx context.Context, runID string) error {
 		return e.fail(runID, err)
 	}
 
-	messages := make([]*schema.Message, 0)
-	contextJSON, contextExists, contextErr := e.runner.Context(run.ConversationID)
-	if contextErr != nil {
-		return e.fail(runID, contextErr)
-	}
-	if contextExists {
-		if err = json.Unmarshal(contextJSON, &messages); err != nil {
-			return e.fail(runID, fmt.Errorf("decode conversation context: %w", err))
-		}
-		messages = sanitizeModelMessages(messages)
-	}
-	messages = append(messages, buildUserMessage(run), schema.AssistantMessage(teamResult.Answer, nil))
-	contextJSON, err = json.Marshal(retainModelMessages(messages))
+	conversationMessages = append(conversationMessages, schema.AssistantMessage(teamResult.Answer, nil))
+	contextJSON, err := json.Marshal(retainModelMessages(conversationMessages))
 	if err != nil {
 		return e.fail(runID, fmt.Errorf("encode team conversation context: %w", err))
 	}
 	_, err = e.runner.Complete(runID, contextJSON)
 	return err
+}
+
+// teamPlanMemoryGoal keeps the literal latest user message for audit while also
+// persisting the Planner's self-contained scope. This remains meaningful after
+// a deictic follow-up such as "go on" without guessing continuation phrases.
+func teamPlanMemoryGoal(request string, steps []TeamStep) string {
+	goals := make([]string, 0, len(steps))
+	for _, step := range steps {
+		if goal := strings.TrimSpace(step.Goal); goal != "" {
+			goals = append(goals, goal)
+		}
+	}
+	request = strings.TrimSpace(request)
+	if len(goals) == 0 {
+		return request
+	}
+	return abbreviateContext(fmt.Sprintf("latest user request: %s\nplanner scope: %s", request, strings.Join(uniqueStrings(goals), " | ")), 8000)
 }
 
 func (e *Engine) Team(worker TeamWorker) *Team {
@@ -857,6 +1002,7 @@ func (e *Engine) Team(worker TeamWorker) *Team {
 
 func (e *Engine) runTeamWorker(ctx context.Context, run domain.Run, chatModel model.ToolCallingChatModel, input TeamWorkInput) (TeamStepResult, error) {
 	ctx = application.WithTeamWorkerExecution(ctx, input.Step.ID, input.Step.Role)
+	ctx = withModelTraceStage(ctx, "worker")
 	if err := normalizeTeamSourceSearch(&input.Step); err != nil {
 		return TeamStepResult{}, fmt.Errorf("validate team worker %s search brief: %w", input.Step.ID, err)
 	}
@@ -976,9 +1122,16 @@ Your final response is a concise evidence report for the supervisor, not JSON. S
 				}
 			}
 		}
-		if message.Role == schema.Assistant && len(message.ToolCalls) == 0 {
-			if content := visibleAssistantContent(message.Content); content != "" {
-				finalContent = content
+		if message.Role == schema.Assistant {
+			if reasoning, tokens := displayableAssistantReasoning(message); reasoning != "" {
+				if err = e.runner.PublishAgentReasoning(ctx, run.ID, "worker", reasoning, tokens); err != nil {
+					return TeamStepResult{}, fmt.Errorf("publish team worker %s reasoning: %w", input.Step.ID, err)
+				}
+			}
+			if len(message.ToolCalls) == 0 {
+				if content := visibleAssistantContent(message.Content); content != "" {
+					finalContent = content
+				}
 			}
 		}
 	}
@@ -1002,6 +1155,7 @@ func (e *Engine) finalizeTeamWorkerReport(ctx context.Context, run domain.Run, f
 	if finalizerModel == nil {
 		return "", errors.New("worker finalizer model is not configured")
 	}
+	ctx = withModelTraceStage(ctx, "worker-finalizer")
 	dependencies, err := json.Marshal(input.Dependencies)
 	if err != nil {
 		return "", fmt.Errorf("encode finalizer dependencies: %w", err)
@@ -1009,15 +1163,22 @@ func (e *Engine) finalizeTeamWorkerReport(ctx context.Context, run domain.Run, f
 	evidenceContext := abbreviateContext(strings.Join(evidenceDigests, "\n"), teamWorkerReportMax)
 	errorContext := abbreviateContext(strings.Join(uniqueStrings(toolErrors), "\n"), 3000)
 	startedAt := time.Now()
-	response, err := finalizerModel.Generate(ctx, []*schema.Message{
+	response, err := generateTeamModel(ctx, finalizerModel, []*schema.Message{
 		schema.SystemMessage(`You are the no-tool finalization stage for one OLT diagnostic worker. You cannot call tools. Write a concise Simplified Chinese supervisor report using only the supplied dependency results and evidence snapshots. Separate observed facts, inference, and remaining gaps. Cite only evidence IDs present in the snapshots. A bounded partial conclusion is valid; never ask for another search or invent missing state.`),
 		schema.UserMessage(fmt.Sprintf("Original goal:\n%s\n\nWorker role and step:\n%s / %s\n\nAssigned goal:\n%s\n\nDependencies:\n%s\n\nEvidence snapshots:\n%s\n\nTool errors:\n%s", input.OriginalGoal, input.Step.Role, input.Step.ID, input.Step.Goal, dependencies, evidenceContext, errorContext)),
+	}, func(_ context.Context, attempt, maxAttempts int, retryErr error) error {
+		return e.runner.PublishAgentMessage(run.ID, fmt.Sprintf("子 Agent %s 的报告整理连接中断，正在进行第 %d/%d 次尝试：%v", input.Step.ID, attempt, maxAttempts, retryErr))
 	})
 	if err != nil {
 		return "", explainModelProviderError(err)
 	}
 	if response == nil || strings.TrimSpace(response.Content) == "" {
 		return "", errors.New("worker finalizer returned an empty report")
+	}
+	if reasoning, tokens := displayableAssistantReasoning(response); reasoning != "" {
+		if err = e.runner.PublishAgentReasoning(ctx, run.ID, "worker-finalizer", reasoning, tokens); err != nil {
+			return "", fmt.Errorf("publish worker finalizer reasoning: %w", err)
+		}
 	}
 	if response.ResponseMeta != nil && response.ResponseMeta.Usage != nil {
 		usage := response.ResponseMeta.Usage

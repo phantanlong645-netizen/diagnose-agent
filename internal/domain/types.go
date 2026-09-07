@@ -49,6 +49,8 @@ type EventType string
 const (
 	EventRunStarted       EventType = "run.started"
 	EventAgentMessage     EventType = "agent.message"
+	EventAgentReasoning   EventType = "agent.reasoning"
+	EventModelHTTPTrace   EventType = "model.http.trace"
 	EventToolProposed     EventType = "tool.proposed"
 	EventApprovalRequired EventType = "approval.required"
 	EventApprovalResolved EventType = "approval.resolved"
