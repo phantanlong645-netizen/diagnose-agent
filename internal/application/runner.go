@@ -213,6 +213,28 @@ func (r *Runner) PublishAgentMessage(runID, content string) error {
 	return r.publish(runID, domain.EventAgentMessage, map[string]string{"content": content})
 }
 
+// PublishAgentMessageWithID 持久化一条已经完成的流式消息。messageId 只用于让
+// 前端用完整消息替换同一张临时卡片，不参与对话上下文或 checkpoint。
+func (r *Runner) PublishAgentMessageWithID(runID, messageID, content string) error {
+	return r.publish(runID, domain.EventAgentMessage, map[string]string{
+		"messageId": messageID,
+		"content":   content,
+	})
+}
+
+// EmitAgentMessageStarted/Delta 只推送到实时 UI，不写入 journal。SQLite 仍然只
+// 保存完成的 agent.message，避免重放会话时出现大量 token 级事件或半截消息。
+func (r *Runner) EmitAgentMessageStarted(runID, messageID string) error {
+	return r.emitTransient(runID, domain.EventAgentMessageStarted, map[string]string{"messageId": messageID})
+}
+
+func (r *Runner) EmitAgentMessageDelta(runID, messageID, delta string) error {
+	return r.emitTransient(runID, domain.EventAgentMessageDelta, map[string]string{
+		"messageId": messageID,
+		"delta":     delta,
+	})
+}
+
 // PublishAgentReasoning 发布模型明确返回且已经过调用方脱敏、截断的调试推理。
 // Team worker 的归属由宿主 context 注入，模型不能自行伪造 worker 标识。
 func (r *Runner) PublishAgentReasoning(ctx context.Context, runID, stage, content string, reasoningTokens int) error {
@@ -348,48 +370,51 @@ func (r *Runner) Evidence(runID, evidenceID string) (domain.Evidence, bool, erro
 	return r.journal.EvidenceByConversation(run.ConversationID, evidenceID)
 }
 
+// Execute 是"单次工具调用"的执行管控入口，被 Eino 的工具调用(excutor)节点调用。
+// 它把"预检 → 守卫 → 事件 → 策略 → 并发 → 审批 → 缓存复用 → 真执行 → 证据 → 记忆 → 缓存刷新"
+// 这一整套生命周期全部串起来。返回值是本次调用捕获的 Evidence（完整证据）。
 func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall) (domain.Evidence, error) {
-	startedAt := time.Now()
-	run, exists := r.Run(runID)
-	if !exists {
+	startedAt := time.Now()     // 记下开始时刻，用于事件里的 elapsedMs（耗时）统计
+	run, exists := r.Run(runID) // ① 按 runID 取出当前运行对象
+	if !exists {                // 这个 run 不存在
 		return domain.Evidence{}, fmt.Errorf("run not found: %s", runID)
 	}
-	if run.Status != domain.RunRunning {
-		return domain.Evidence{}, fmt.Errorf("run is not active: %s", run.Status)
+	if run.Status != domain.RunRunning { // run 存在但不在 running 状态
+		return domain.Evidence{}, fmt.Errorf("run is not active: %s", run.Status) // 拒绝执行
 	}
 
-	tool, prepared, err := r.registry.Prepare(call)
-	if err != nil {
-		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
+	tool, prepared, err := r.registry.Prepare(call) // ② Prepare：从注册表解析出可执行 tool + 校验后的 prepared 上下文
+	if err != nil {                                 // Prepare 失败（工具名未知/参数不合法等）
+		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil { // 发 tool.failed 事件本身也出错
+			return domain.Evidence{}, errors.Join(err, eventErr) // 合并两个错误返回
+		}
+		return domain.Evidence{}, err // 事件发成功，但本次调用失败
+	}
+	if readOnly, _ := ctx.Value(readOnlyExecutionKey{}).(bool); readOnly && !prepared.Annotations.ReadOnly { // ③ 只读守卫：当前是只读 ctx 且工具非只读
+		err = fmt.Errorf("team worker is read-only; tool call %s would change or control external state", call.Name) // 构造拦截原因
+		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {                                          // 同样走 failTool 兜底
 			return domain.Evidence{}, errors.Join(err, eventErr)
 		}
-		return domain.Evidence{}, err
+		return domain.Evidence{}, err // 拦截：只读 worker 不允许改状态的工具
 	}
-	if readOnly, _ := ctx.Value(readOnlyExecutionKey{}).(bool); readOnly && !prepared.Annotations.ReadOnly {
-		err = fmt.Errorf("team worker is read-only; tool call %s would change or control external state", call.Name)
-		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
-			return domain.Evidence{}, errors.Join(err, eventErr)
-		}
-		return domain.Evidence{}, err
+	publicCall := map[string]any{ // 组装"对外公开"的工具调用描述（不含内部 client 等敏感字段）
+		"callId":      call.ID,              // 本次调用的唯一 ID
+		"name":        call.Name,            // 工具名
+		"summary":     prepared.Summary,     // Prepare 时算好的一句话摘要
+		"annotations": prepared.Annotations, // 工具注解（ReadOnly/Idempotent 等），供前端展示
 	}
-	publicCall := map[string]any{
-		"callId":      call.ID,
-		"name":        call.Name,
-		"summary":     prepared.Summary,
-		"annotations": prepared.Annotations,
-	}
-	addTeamWorkerEventFields(ctx, publicCall)
-	if err = r.publish(runID, domain.EventToolProposed, publicCall); err != nil {
+	addTeamWorkerEventFields(ctx, publicCall)                                     // 若在 Team worker ctx 里，给 publicCall 附上 step_id/role
+	if err = r.publish(runID, domain.EventToolProposed, publicCall); err != nil { // ④ 发布"提议执行"事件
 		return domain.Evidence{}, err
 	}
 
-	decision := r.policy.Evaluate(prepared)
-	if !decision.Allowed {
-		err = errors.New(decision.Reason)
-		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
+	decision := r.policy.Evaluate(prepared) // ⑤ 策略评估：该工具+参数是否允许、是否需审批
+	if !decision.Allowed {                  // 策略直接不允许
+		err = errors.New(decision.Reason)                                   // 用决策理由构造错误
+		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil { // 发 tool.failed 事件
 			return domain.Evidence{}, errors.Join(err, eventErr)
 		}
-		return domain.Evidence{}, err
+		return domain.Evidence{}, err // 策略拒绝：不执行
 	}
 
 	// Eino may execute independent tool calls concurrently. Keep the
@@ -398,90 +423,90 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 	// exclusive section. The gate is acquired before approval so concurrent
 	// state-changing calls cannot create multiple approval prompts or overlap
 	// after approval.
-	releaseToolExecution := r.acquireToolExecution(prepared)
-	defer releaseToolExecution()
+	releaseToolExecution := r.acquireToolExecution(prepared) // ⑥ 并发闸门：按读写类型加共享读锁或互斥锁
+	defer releaseToolExecution()                             // 函数返回时无论成败都自动解锁
 
-	if decision.ApprovalRequired {
-		if r.approval != nil && r.approval.ConversationApproved(run.ConversationID) {
-			if err = r.publish(runID, domain.EventApprovalResolved, map[string]any{
+	if decision.ApprovalRequired { // ⑦ 需要人工审批才进这个分支
+		if r.approval != nil && r.approval.ConversationApproved(run.ConversationID) { // 本会话已被用户整会话授权过
+			if err = r.publish(runID, domain.EventApprovalResolved, map[string]any{ // 就此自动放行
 				"callId":    call.ID,
 				"approved":  true,
-				"automatic": true,
+				"automatic": true, // 标记"自动通过"（因会话级授权）
 				"scope":     "conversation",
 			}); err != nil {
 				return domain.Evidence{}, err
 			}
-		} else {
-			request := domain.ApprovalRequest{
-				ConversationID: run.ConversationID,
-				RunID:          runID,
-				CallID:         call.ID,
-				ToolName:       call.Name,
-				Summary:        prepared.Summary,
-				Reason:         decision.Reason,
-				Preview:        prepared.Preview,
-				Annotations:    prepared.Annotations,
+		} else { // 没有会话级授权 → 逐次弹审批请求等用户
+			request := domain.ApprovalRequest{ // 组装审批请求体
+				ConversationID: run.ConversationID,   // 归属会话
+				RunID:          runID,                // 归属 run
+				CallID:         call.ID,              // 本次调用 ID
+				ToolName:       call.Name,            // 工具名（展示给用户）
+				Summary:        prepared.Summary,     // 一句话说明做什么
+				Reason:         decision.Reason,      // 为什么需要审批
+				Preview:        prepared.Preview,     // 预览（如 XML/命令）
+				Annotations:    prepared.Annotations, // 注解
 			}
-			if r.approval == nil {
-				err = errors.New("approval handler is not configured")
+			if r.approval == nil { // 没配审批 handler
+				err = errors.New("approval handler is not configured") // 无法审批
 				if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
 					return domain.Evidence{}, errors.Join(err, eventErr)
 				}
 				return domain.Evidence{}, err
 			}
-			if err = r.approval.Open(request); err != nil {
+			if err = r.approval.Open(request); err != nil { // 把审批请求打开（前端弹出）
 				if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
 					return domain.Evidence{}, errors.Join(err, eventErr)
 				}
 				return domain.Evidence{}, err
 			}
-			if err = r.publish(runID, domain.EventApprovalRequired, request); err != nil {
-				_ = r.approval.Resolve(call.ID, false, false)
+			if err = r.publish(runID, domain.EventApprovalRequired, request); err != nil { // 发布"需要审批"事件
+				_ = r.approval.Resolve(call.ID, false, false) // 发布失败 → 兜底：把该请求回滚为拒绝
 				return domain.Evidence{}, err
 			}
-			approved, approvalErr := r.approval.Wait(ctx, call.ID)
-			if approvalErr != nil {
+			approved, approvalErr := r.approval.Wait(ctx, call.ID) // 阻塞等待用户点"通过/拒绝"
+			if approvalErr != nil {                                // 等审批过程自身出错
 				if eventErr := r.failTool(ctx, runID, call, approvalErr); eventErr != nil {
 					return domain.Evidence{}, errors.Join(approvalErr, eventErr)
 				}
 				return domain.Evidence{}, approvalErr
 			}
-			if !approved {
+			if !approved { // 用户点了"拒绝"
 				if err = r.publish(runID, domain.EventApprovalResolved, map[string]any{"callId": call.ID, "approved": false}); err != nil {
 					return domain.Evidence{}, err
 				}
-				if eventErr := r.failTool(ctx, runID, call, ErrApprovalDeclined); eventErr != nil {
+				if eventErr := r.failTool(ctx, runID, call, ErrApprovalDeclined); eventErr != nil { // 记为被拒
 					return domain.Evidence{}, errors.Join(ErrApprovalDeclined, eventErr)
 				}
-				return domain.Evidence{}, ErrApprovalDeclined
+				return domain.Evidence{}, ErrApprovalDeclined // 返回"审批被拒"错误
 			}
-			scope := "once"
-			if r.approval.ConversationApproved(run.ConversationID) {
-				scope = "conversation"
+			scope := "once"                                          // 默认本次一次性授权
+			if r.approval.ConversationApproved(run.ConversationID) { // 若用户在批准时勾选了"本会话都允许"
+				scope = "conversation" // 标记为会话级授权
 			}
-			if err = r.publish(runID, domain.EventApprovalResolved, map[string]any{"callId": call.ID, "approved": true, "scope": scope}); err != nil {
+			if err = r.publish(runID, domain.EventApprovalResolved, map[string]any{"callId": call.ID, "approved": true, "scope": scope}); err != nil { // 发布"已批准"
 				return domain.Evidence{}, err
 			}
 		}
 	}
-	fingerprint := toolCallFingerprint(call)
-	if canReuseToolResult(prepared) {
-		reuseKey := reusableEvidenceKey(run, fingerprint)
-		r.evidenceMu.RLock()
-		reused, found := r.reusable[reuseKey]
+	fingerprint := toolCallFingerprint(call) // ⑧ 计算本次调用的指纹（工具名+参数 的 SHA-256）
+	if canReuseToolResult(prepared) {        // 仅"安全只读"工具才尝试复用缓存
+		reuseKey := reusableEvidenceKey(run, fingerprint) // 本会话+目标+指纹 组成内存缓存 key
+		r.evidenceMu.RLock()                              // 读缓存加读锁
+		reused, found := r.reusable[reuseKey]             // 内存缓存里查
 		r.evidenceMu.RUnlock()
-		if found {
-			if err = r.publish(runID, domain.EventToolStarted, publicCall); err != nil {
+		if found { // 内存命中 → 直接复用旧证据，不再执行
+			if err = r.publish(runID, domain.EventToolStarted, publicCall); err != nil { // 仍发布 started
 				return domain.Evidence{}, err
 			}
 			if err = r.publish(runID, domain.EventToolCompleted, addTeamWorkerEventFields(ctx, map[string]any{
 				"callId": call.ID, "name": call.Name, "successful": true,
-				"summary": prepared.Summary, "evidenceId": reused.ID, "reused": true,
+				"summary": prepared.Summary, "evidenceId": reused.ID, "reused": true, // 标记 reused=true
 				"elapsedMs": time.Since(startedAt).Milliseconds(),
 			})); err != nil {
 				return domain.Evidence{}, err
 			}
-			return reused, nil
+			return reused, nil // 直接返回复用到的证据
 		}
 		// 内存缓存未命中：查 SQLite 的 tool_fingerprints 表，看同 conversation 是否
 		// 之前 Run 跑过相同的只读调用。命中后通过 evidence_id 直接拿回旧结果，
@@ -491,78 +516,78 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 		// 安全性：只对 canReuseToolResult 返回 true 的工具复用（ReadOnly+Idempotent+!Destructive+!Sensitive）。
 		// 设备状态会随时间变化，但同 conversation 的连续对话通常在短时间内发生，
 		// 复用上一次查询结果是可接受的（用户想刷新可以换一个查询参数，fingerprint 就不同）。
-		storedRecord, storedFound, storedErr := r.journal.ToolFingerprint(run.ConversationID, fingerprint)
-		if storedErr == nil && storedFound && storedRecord.Successful && storedRecord.EvidenceID != "" {
-			storedEvidence, evidenceFound, evidenceErr := r.journal.EvidenceByConversation(run.ConversationID, storedRecord.EvidenceID)
-			if evidenceErr == nil && evidenceFound {
+		storedRecord, storedFound, storedErr := r.journal.ToolFingerprint(run.ConversationID, fingerprint) // 查 SQLite 指纹
+		if storedErr == nil && storedFound && storedRecord.Successful && storedRecord.EvidenceID != "" {   // 命中且上次成功、有证据ID
+			storedEvidence, evidenceFound, evidenceErr := r.journal.EvidenceByConversation(run.ConversationID, storedRecord.EvidenceID) // 按 evidence_id 从 events 表取完整证据
+			if evidenceErr == nil && evidenceFound {                                                                                    // 证据也取到了
 				// 把跨 Run 复用的 evidence 也填进内存缓存，避免后续命中还要再查 SQLite。
 				r.evidenceMu.Lock()
-				r.reusable[reuseKey] = storedEvidence
+				r.reusable[reuseKey] = storedEvidence // 回填内存缓存加速后续命中
 				r.evidenceMu.Unlock()
 				if err = r.publish(runID, domain.EventToolStarted, publicCall); err != nil {
 					return domain.Evidence{}, err
 				}
 				if err = r.publish(runID, domain.EventToolCompleted, addTeamWorkerEventFields(ctx, map[string]any{
 					"callId": call.ID, "name": call.Name, "successful": true,
-					"summary": prepared.Summary, "evidenceId": storedEvidence.ID, "reused": true, "source": "sqlite",
+					"summary": prepared.Summary, "evidenceId": storedEvidence.ID, "reused": true, "source": "sqlite", // 来源标记 SQLite
 					"elapsedMs": time.Since(startedAt).Milliseconds(),
 				})); err != nil {
 					return domain.Evidence{}, err
 				}
-				return storedEvidence, nil
+				return storedEvidence, nil // 返回复用的证据
 			}
 		}
 	}
 
-	if err = r.publish(runID, domain.EventToolStarted, publicCall); err != nil {
+	if err = r.publish(runID, domain.EventToolStarted, publicCall); err != nil { // ⑨ 宣布真正开始执行
 		return domain.Evidence{}, err
 	}
-	result, err := tool.Execute(ctx, prepared)
-	if err != nil {
-		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil {
+	result, err := tool.Execute(ctx, prepared) // 真正执行工具（连设备/发请求/扫文件）
+	if err != nil {                            // 执行失败
+		if eventErr := r.failTool(ctx, runID, call, err); eventErr != nil { // 发 tool.failed + 记 error 指纹
 			return domain.Evidence{}, errors.Join(err, eventErr)
 		}
 		return domain.Evidence{}, err
 	}
 
-	evidence := domain.Evidence{
-		ID:         uuid.NewString(),
-		RunID:      runID,
-		CallID:     call.ID,
-		Kind:       call.Name,
-		Summary:    result.Summary,
-		Data:       result.Data,
-		Message:    result.Message,
-		Metadata:   result.Metadata,
-		CapturedAt: time.Now().UTC(),
+	evidence := domain.Evidence{ // ⑩ 构造本次调用捕获的证据
+		ID:         uuid.NewString(), // 全新唯一 evidence id
+		RunID:      runID,            // 归属 run
+		CallID:     call.ID,          // 归属调用
+		Kind:       call.Name,        // 工具名
+		Summary:    result.Summary,   // 工具返回的摘要
+		Data:       result.Data,      // 完整正文（data.content 等）
+		Message:    result.Message,   // 附加消息
+		Metadata:   result.Metadata,  // 元信息
+		CapturedAt: time.Now().UTC(), // 捕获时间
 	}
-	if worker, ok := teamWorkerFromContext(ctx); ok {
-		if evidence.Metadata == nil {
+	if worker, ok := teamWorkerFromContext(ctx); ok { // 若在 Team worker 上下文中
+		if evidence.Metadata == nil { // 没有元信息则先建一个
 			evidence.Metadata = make(map[string]string, 2)
 		}
-		evidence.Metadata["team.worker_step_id"] = worker.StepID
-		evidence.Metadata["team.worker_role"] = worker.Role
+		evidence.Metadata["team.worker_step_id"] = worker.StepID // 记录归属 worker 步骤
+		evidence.Metadata["team.worker_role"] = worker.Role      // 记录归属 worker 角色
 	}
-	if err = r.publish(runID, domain.EventEvidenceCaptured, evidence); err != nil {
+	if err = r.publish(runID, domain.EventEvidenceCaptured, evidence); err != nil { // 发布"抓到证据"事件 → events 表
 		return domain.Evidence{}, err
 	}
-	if err = r.publish(runID, domain.EventToolCompleted, addTeamWorkerEventFields(ctx, map[string]any{
+	if err = r.publish(runID, domain.EventToolCompleted, addTeamWorkerEventFields(ctx, map[string]any{ // 发布"工具完成"
 		"callId":     call.ID,
 		"name":       call.Name,
 		"successful": true,
 		"summary":    prepared.Summary,
-		"evidenceId": evidence.ID,
+		"evidenceId": evidence.ID, // 本次证据 id
 		"elapsedMs":  time.Since(startedAt).Milliseconds(),
 	})); err != nil {
 		return domain.Evidence{}, err
 	}
-	if err = r.recordToolMemory(run, call, prepared, evidence); err != nil {
+	if err = r.recordToolMemory(run, call, prepared, evidence); err != nil { // ⑪ 沉淀长期记忆 fact(含 evidenceId)
 		return domain.Evidence{}, err
 	}
-	if canReuseToolResult(prepared) {
+	if canReuseToolResult(prepared) { // 只读工具执行成功 → 缓存本次证据供下次复用
 		reuseKey := reusableEvidenceKey(run, fingerprint)
 		r.evidenceMu.Lock()
-		r.reusable[reuseKey] = evidence
+		r.reusable[reuseKey] = evidence // 写进内存缓存
 		r.evidenceMu.Unlock()
 	}
 	// 写入类工具（POST/PUT/PATCH/DELETE/edit-config/commit 等）成功后，必须清空
@@ -570,10 +595,10 @@ func (r *Runner) Execute(ctx context.Context, runID string, call domain.ToolCall
 	// 返回写入前的快照，导致"写入成功但验证看不到结果"的幻觉。
 	// canReuseToolResult 只对 ReadOnly+Idempotent 工具返回 true，写入工具不在此列，
 	// 所以这里用 !ReadOnly 作为"写入类"的判据。
-	if !prepared.Annotations.ReadOnly {
+	if !prepared.Annotations.ReadOnly { // ⑫ 写工具成功 → 作废整个会话的只读缓存，防脏读
 		r.invalidateReusableCache(run.ConversationID)
 	}
-	return evidence, nil
+	return evidence, nil // 返回捕获的证据（成功）
 }
 
 // MCPToolInfos returns the minimal description of every registered MCP tool so
@@ -779,6 +804,15 @@ func (r *Runner) publish(runID string, eventType domain.EventType, payload any) 
 		return err
 	}
 	r.emit(event)
+	return nil
+}
+
+func (r *Runner) emitTransient(runID string, eventType domain.EventType, payload any) error {
+	run, exists := r.Run(runID)
+	if !exists {
+		return fmt.Errorf("run not found: %s", runID)
+	}
+	r.emit(newRunEvent(run, eventType, payload))
 	return nil
 }
 

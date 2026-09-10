@@ -57,6 +57,13 @@ type DiagnosticEvent = {
     payload?: any;
 };
 
+type StreamingAgentMessage = {
+    messageId: string;
+    runId: string;
+    timestamp: string;
+    content: string;
+};
+
 type TeamStep = {
     id: string;
     goal: string;
@@ -264,6 +271,7 @@ function App() {
     const [showHistory, setShowHistory] = useState(false);
     const [run, setRun] = useState<DiagnosticRun | null>(null);
     const [events, setEvents] = useState<DiagnosticEvent[]>([]);
+    const [streamingMessages, setStreamingMessages] = useState<Record<string, StreamingAgentMessage>>({});
     const [selectedEvidence, setSelectedEvidence] = useState<Evidence | null>(null);
     const [showSetup, setShowSetup] = useState(true);
     const [setupTab, setSetupTab] = useState<'target' | 'model'>('target');
@@ -288,12 +296,45 @@ function App() {
     const [conversationApproval, setConversationApproval] = useState(false);
     const timelineRef = useRef<HTMLDivElement | null>(null);
     const followTimelineRef = useRef(true);
+    const pendingStreamDeltasRef = useRef<Map<string, {runId: string; timestamp: string; delta: string}>>(new Map());
+    const streamFlushTimerRef = useRef<number | null>(null);
+
+    function flushStreamingDeltas() {
+        streamFlushTimerRef.current = null;
+        const pending = new Map(pendingStreamDeltasRef.current);
+        pendingStreamDeltasRef.current.clear();
+        if (pending.size === 0) return;
+        setStreamingMessages(current => {
+            const next = {...current};
+            for (const [messageId, item] of pending) {
+                const previous = next[messageId];
+                next[messageId] = {
+                    messageId,
+                    runId: item.runId,
+                    timestamp: previous?.timestamp ?? item.timestamp,
+                    content: `${previous?.content ?? ''}${item.delta}`,
+                };
+            }
+            return next;
+        });
+    }
+
+    function clearStreamingMessages(runID?: string) {
+        for (const [messageId, item] of pendingStreamDeltasRef.current) {
+            if (!runID || item.runId === runID) pendingStreamDeltasRef.current.delete(messageId);
+        }
+        setStreamingMessages(current => {
+            if (!runID) return {};
+            return Object.fromEntries(Object.entries(current).filter(([, item]) => item.runId !== runID));
+        });
+    }
 
     async function loadConversationState(current: Conversation) {
         const [storedEvents, approvalEnabled] = await Promise.all([
             api().ConversationEvents(current.id) as Promise<DiagnosticEvent[]>,
             api().ConversationApprovalEnabled(current.id) as Promise<boolean>,
         ]);
+        clearStreamingMessages();
         setConversation(current);
         setEvents(storedEvents ?? []);
         setConversationApproval(Boolean(approvalEnabled));
@@ -325,9 +366,44 @@ function App() {
                 .catch(reason => setError(String(reason)));
 
             EventsOn('diagnostic:event', (event: DiagnosticEvent) => {
+                const messageID = String(event.payload?.messageId ?? '');
+                if (event.type === 'agent.message.started' && messageID) {
+                    setStreamingMessages(current => ({
+                        ...current,
+                        [messageID]: {
+                            messageId: messageID,
+                            runId: event.runId,
+                            timestamp: event.timestamp,
+                            content: current[messageID]?.content ?? '',
+                        },
+                    }));
+                    return;
+                }
+                if (event.type === 'agent.message.delta' && messageID) {
+                    const previous = pendingStreamDeltasRef.current.get(messageID);
+                    pendingStreamDeltasRef.current.set(messageID, {
+                        runId: event.runId,
+                        timestamp: previous?.timestamp ?? event.timestamp,
+                        delta: `${previous?.delta ?? ''}${String(event.payload?.delta ?? '')}`,
+                    });
+                    if (streamFlushTimerRef.current === null) {
+                        streamFlushTimerRef.current = window.setTimeout(flushStreamingDeltas, 40);
+                    }
+                    return;
+                }
+                if (event.type === 'agent.message' && messageID) {
+                    pendingStreamDeltasRef.current.delete(messageID);
+                    setStreamingMessages(current => {
+                        if (!current[messageID]) return current;
+                        const next = {...current};
+                        delete next[messageID];
+                        return next;
+                    });
+                }
                 setEvents(current => current.some(item => item.id === event.id) ? current : [...current, event]);
                 if (event.type === 'evidence.captured') setSelectedEvidence(event.payload as Evidence);
                 if (event.type === 'run.completed' || event.type === 'run.failed' || event.type === 'run.cancelled') {
+                    clearStreamingMessages(event.runId);
                     const status = event.type.replace('run.', '');
                     terminalRunStatusRef.current[event.runId] = status;
                     setRun(current => current?.id === event.runId ? {...current, status} : current);
@@ -337,7 +413,10 @@ function App() {
                 }
                 if (event.type === 'run.failed') setError(String(event.payload?.error ?? 'Diagnostic run failed'));
             });
-            return () => EventsOff('diagnostic:event');
+            return () => {
+                EventsOff('diagnostic:event');
+                if (streamFlushTimerRef.current !== null) window.clearTimeout(streamFlushTimerRef.current);
+            };
         } catch (reason) {
             setError(reason instanceof Error ? reason.message : String(reason));
         }
@@ -359,6 +438,7 @@ function App() {
             setConversationHistory([]);
             setShowHistory(false);
             setEvents([]);
+            clearStreamingMessages();
             setRun(null);
             setConversationApproval(false);
             return;
@@ -385,7 +465,7 @@ function App() {
         if (!followTimelineRef.current || !timelineRef.current) return;
         const timeline = timelineRef.current;
         requestAnimationFrame(() => timeline.scrollTo({top: timeline.scrollHeight, behavior: 'auto'}));
-    }, [events]);
+    }, [events, streamingMessages]);
 
     useEffect(() => {
         if (!run || !['completed', 'failed', 'cancelled'].includes(run.status)) return;
@@ -483,6 +563,7 @@ function App() {
             const created = await api().NewConversation(profileId) as Conversation;
             setConversation(created);
             setEvents([]);
+            clearStreamingMessages();
             setSelectedEvidence(null);
             setRun(null);
             setGoal('');
@@ -828,7 +909,7 @@ function App() {
                                 <p>Select a target, state the symptom, and the agent will build an evidence trail before drawing a conclusion.</p>
                             </div>
                         )}
-                        <TimelineFeed events={events} onEvidence={setSelectedEvidence}/>
+                        <TimelineFeed events={events} streamingMessages={Object.values(streamingMessages)} onEvidence={setSelectedEvidence}/>
                     </div>
 
                     {approval && run?.status === 'running' && (
@@ -912,7 +993,7 @@ function ReasoningDisclosure({events, compact = false}: {events: DiagnosticEvent
     </details>;
 }
 
-function TimelineFeed({events, onEvidence}: {events: DiagnosticEvent[]; onEvidence: (evidence: Evidence) => void}) {
+function TimelineFeed({events, streamingMessages, onEvidence}: {events: DiagnosticEvent[]; streamingMessages: StreamingAgentMessage[]; onEvidence: (evidence: Evidence) => void}) {
     const teamPlanByRun = new Map<string, DiagnosticEvent>();
     const evidenceByID = new Map<string, Evidence>();
     for (const event of events) {
@@ -930,7 +1011,24 @@ function TimelineFeed({events, onEvidence}: {events: DiagnosticEvent[]; onEviden
             ['tool.proposed', 'tool.started', 'tool.completed', 'tool.failed', 'evidence.captured'].includes(event.type);
         if (teamPlanByRun.has(event.runId) && isTeamExecutionEvent) return null;
         return <TimelineEvent key={event.id} event={event} evidenceByID={evidenceByID} onEvidence={onEvidence}/>;
-    })}</>;
+    })}{streamingMessages.map(message => <StreamingTimelineMessage key={message.messageId} message={message} evidenceByID={evidenceByID} onEvidence={onEvidence}/>)}</>;
+}
+
+function StreamingTimelineMessage({message, evidenceByID, onEvidence}: {
+    message: StreamingAgentMessage;
+    evidenceByID: Map<string, Evidence>;
+    onEvidence: (evidence: Evidence) => void;
+}) {
+    return <article className="trace-event trace-agent-message trace-agent-message-streaming">
+        <time>{new Date(message.timestamp).toLocaleTimeString([], {hour12: false})}</time>
+        <span className="trace-node"/>
+        <div className="trace-content">
+            <small>agent.message</small>
+            <strong>Agent analysis</strong>
+            {message.content && <MarkdownMessage content={message.content} evidenceByID={evidenceByID} onEvidence={onEvidence}/>}
+            <span className="streaming-cursor" aria-label="Agent is responding"/>
+        </div>
+    </article>;
 }
 
 function TeamExecutionBoard({planEvent, events, evidenceByID, onEvidence}: {

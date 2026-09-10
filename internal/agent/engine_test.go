@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	einoopenai "github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/adk"
@@ -95,6 +96,75 @@ func TestDisplayableAssistantReasoningDeduplicatesAndBoundsUnicode(t *testing.T)
 	}
 	if strings.Count(content, "...[truncated]...") != 1 {
 		t.Fatalf("reasoning was not deduplicated and bounded once: %q", content)
+	}
+}
+
+func TestConsumeAgentEventMessageStreamsVisibleContentWithoutThinkBlocks(t *testing.T) {
+	stream := schema.StreamReaderFromArray([]*schema.Message{
+		schema.AssistantMessage("<thi", nil),
+		schema.AssistantMessage("nk>private reasoning</thi", nil),
+		schema.AssistantMessage("nk>根据当前证据，", nil),
+		schema.AssistantMessage("NTP 请求失败。", nil),
+	})
+	event := adk.EventFromMessage(nil, stream, schema.Assistant, "")
+	var deltas strings.Builder
+
+	message, err := consumeAgentEventMessage(event, func(delta string) error {
+		deltas.WriteString(delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := deltas.String(), "根据当前证据，NTP 请求失败。"; got != want {
+		t.Fatalf("visible deltas = %q, want %q", got, want)
+	}
+	if got, want := visibleAssistantContent(message.Content), deltas.String(); got != want {
+		t.Fatalf("completed visible content = %q, streamed content = %q", got, want)
+	}
+	if strings.Contains(deltas.String(), "private reasoning") || strings.Contains(deltas.String(), "<thi") {
+		t.Fatalf("reasoning leaked into visible stream: %q", deltas.String())
+	}
+}
+
+func TestConsumeAgentEventMessageKeepsEinoToolCallConcatenation(t *testing.T) {
+	index := 0
+	stream := schema.StreamReaderFromArray([]*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{{
+			Index: &index,
+			ID:    "call-1",
+			Type:  "function",
+			Function: schema.FunctionCall{
+				Name:      "netconf_rpc",
+				Arguments: `{"rpc":"<get`,
+			},
+		}}),
+		schema.AssistantMessage("", []schema.ToolCall{{
+			Index: &index,
+			Function: schema.FunctionCall{
+				Arguments: `/>"}`,
+			},
+		}}),
+	})
+	event := adk.EventFromMessage(nil, stream, schema.Assistant, "")
+	deltaCalls := 0
+
+	message, err := consumeAgentEventMessage(event, func(string) error {
+		deltaCalls++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deltaCalls != 0 {
+		t.Fatalf("tool-call-only stream emitted %d visible deltas, want 0", deltaCalls)
+	}
+	if len(message.ToolCalls) != 1 {
+		t.Fatalf("merged tool calls = %d, want 1", len(message.ToolCalls))
+	}
+	call := message.ToolCalls[0]
+	if call.ID != "call-1" || call.Function.Name != "netconf_rpc" || call.Function.Arguments != `{"rpc":"<get/>"}` {
+		t.Fatalf("tool call was not merged by Eino semantics: %+v", call)
 	}
 }
 
@@ -399,6 +469,10 @@ type contextSummaryModelMock struct {
 	err      error
 }
 
+type streamingModelMock struct {
+	chunks []*schema.Message
+}
+
 type flakyTeamModelMock struct {
 	response  *schema.Message
 	err       error
@@ -526,6 +600,18 @@ func (m *contextSummaryModelMock) Stream(context.Context, []*schema.Message, ...
 }
 
 func (m *contextSummaryModelMock) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+
+func (m *streamingModelMock) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	return nil, errors.New("Generate is not used by the streaming test model")
+}
+
+func (m *streamingModelMock) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return schema.StreamReaderFromArray(m.chunks), nil
+}
+
+func (m *streamingModelMock) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
 	return m, nil
 }
 
@@ -842,6 +928,45 @@ func TestTracedChatModelWithToolsPreservesTracing(t *testing.T) {
 	}
 	if len(records) != 1 || records[0]["toolCount"] != 2 || records[0]["stage"] != "worker" || records[0]["failurePhase"] != "complete" {
 		t.Fatalf("WithTools did not preserve trace metadata: %+v", records)
+	}
+}
+
+func TestTracedChatModelRecordsStreamAfterItIsConsumed(t *testing.T) {
+	records := make(chan map[string]any, 1)
+	chatModel := &tracedChatModel{
+		base: &streamingModelMock{chunks: []*schema.Message{
+			schema.AssistantMessage("first ", nil),
+			schema.AssistantMessage("second", nil),
+		}},
+		modelName: "stream-model",
+		recordTrace: func(_ context.Context, _ string, payload map[string]any) {
+			records <- payload
+		},
+	}
+	stream, err := chatModel.Stream(
+		withModelTraceRun(context.Background(), "run-stream", "agent"),
+		[]*schema.Message{schema.UserMessage("inspect")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := schema.ConcatMessageStream(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Content != "first second" {
+		t.Fatalf("stream content = %q, want %q", message.Content, "first second")
+	}
+	select {
+	case record := <-records:
+		if record["stream"] != true || record["stage"] != "agent" || record["failurePhase"] != "complete" {
+			t.Fatalf("stream trace metadata is incomplete: %+v", record)
+		}
+		if bytes, _ := record["responseMessageBytes"].(int); bytes <= 0 {
+			t.Fatalf("stream trace response bytes = %v, want > 0", record["responseMessageBytes"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream trace was not recorded after consumption")
 	}
 }
 

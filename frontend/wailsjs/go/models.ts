@@ -1,15 +1,16 @@
 export namespace domain {
+	
 	export class MCPServerStatus {
 	    name: string;
 	    transport: string;
 	    connected: boolean;
 	    toolCount: number;
 	    error?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new MCPServerStatus(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -24,11 +25,11 @@ export namespace domain {
 	    configured: boolean;
 	    configError?: string;
 	    servers?: MCPServerStatus[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new MCPStatus(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.configPath = source["configPath"];
@@ -36,7 +37,7 @@ export namespace domain {
 	        this.configError = source["configError"];
 	        this.servers = this.convertValues(source["servers"], MCPServerStatus);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -55,7 +56,6 @@ export namespace domain {
 		    return a;
 		}
 	}
-	
 	export class AgentReadiness {
 	    ready: boolean;
 	    targetConfigured: boolean;
@@ -81,7 +81,7 @@ export namespace domain {
 	        this.mcp = this.convertValues(source["mcp"], MCPStatus);
 	        this.issues = source["issues"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -298,6 +298,8 @@ export namespace domain {
 	        this.data = source["data"];
 	    }
 	}
+	
+	
 	export class ManualDraft {
 	    kind: string;
 	    method?: string;
@@ -733,3 +735,4 @@ export namespace tools {
 	}
 
 }
+

@@ -328,10 +328,79 @@ func (m *tracedChatModel) Generate(ctx context.Context, messages []*schema.Messa
 	return response, err
 }
 
-// 当前项目的 Agent/Team runner 都使用非流式 Generate。Stream 保持原样透传，
-// 避免在调用刚返回 reader、响应尚未消费完时误报一次“完成”事件。
+// Stream 在 reader 被消费完成后再记录 trace。这样首字节、响应字节数和流中途
+// 发生的 EOF/取消都对应真实消费结果，而不是把“拿到 reader”误报为调用完成。
 func (m *tracedChatModel) Stream(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	return m.base.Stream(ctx, messages, opts...)
+	scope, scoped := ctx.Value(modelTraceScopeContextKey{}).(modelTraceScope)
+	if !scoped || scope.runID == "" || m.recordTrace == nil {
+		return m.base.Stream(ctx, messages, opts...)
+	}
+	sequence := int64(0)
+	if scope.sequence != nil {
+		sequence = scope.sequence.Add(1)
+	}
+	traceID := uuid.NewString()
+	state := newModelHTTPTraceState()
+	traceContext := context.WithValue(ctx, modelHTTPTraceStateContextKey{}, state)
+	stream, err := m.base.Stream(traceContext, messages, opts...)
+	record := func(callErr error, responseBytes int) {
+		payload := state.payload(callErr)
+		payload["traceId"] = traceID
+		if scope.logicalCallID != "" {
+			payload["logicalCallId"] = scope.logicalCallID
+		} else {
+			payload["logicalCallId"] = traceID
+		}
+		payload["stage"] = scope.stage
+		payload["sequence"] = sequence
+		if scope.attempt > 0 {
+			payload["attempt"] = scope.attempt
+		}
+		payload["model"] = m.modelName
+		payload["messageCount"] = len(messages)
+		payload["messageBytes"] = messageBlockBytes(messages)
+		payload["toolCount"] = m.toolCount
+		payload["stream"] = true
+		if responseBytes > 0 {
+			payload["responseMessageBytes"] = responseBytes
+		}
+		m.recordTrace(ctx, scope.runID, payload)
+	}
+	if err != nil {
+		record(err, 0)
+		return nil, err
+	}
+	if stream == nil {
+		err = errors.New("model returned a nil stream reader")
+		record(err, 0)
+		return nil, err
+	}
+
+	reader, writer := schema.Pipe[*schema.Message](8)
+	go func() {
+		defer writer.Close()
+		responseBytes := 0
+		var streamErr error
+		for {
+			chunk, receiveErr := stream.Recv()
+			if errors.Is(receiveErr, io.EOF) {
+				break
+			}
+			if receiveErr != nil {
+				streamErr = receiveErr
+				writer.Send(nil, receiveErr)
+				break
+			}
+			responseBytes += modelMessageBytes(chunk)
+			if writer.Send(chunk, nil) {
+				streamErr = context.Canceled
+				break
+			}
+		}
+		stream.Close()
+		record(streamErr, responseBytes)
+	}()
+	return reader, nil
 }
 
 func (m *tracedChatModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
@@ -1176,23 +1245,42 @@ func sanitizeModelMessages(messages []*schema.Message) []*schema.Message {
 // 二进制的多模态负载是"单次请求"作用域：如果留在 SQLite 里，后续每一轮都会
 // 把大段 Base64 重新发给模型。文本部分保留为普通 Content，媒体部分用一个
 // 标记记录"当时有媒体"，而不假装它仍然可用。
+//
+// 输入：原始 state.Messages 或摘要投影前消息。
+// 输出：过滤后的安全消息（无 system/无二进制/无 reasoning/文本脱敏/多媒体字段清空）。
 func retainModelMessages(messages []*schema.Message) []*schema.Message {
+	// 第一步：sanitizeModelMessages 清理异常消息（nil、空 role 等防御性过滤）。
 	safe := sanitizeModelMessages(messages)
+
+	// retained：保留的消息列表，预分配容量避免反复扩容。
 	retained := make([]*schema.Message, 0, len(safe))
+
 	for _, message := range safe {
+		// 跳过 nil 消息（sanitize 后一般不会有，但防御性保留）。
 		if message == nil {
 			continue
 		}
+
+		// 丢掉 system 消息。
 		// 当前指令与诊断记忆在每次模型调用前都会重新生成，把它们持久化会造成
 		// 续聊时的过期重复 system 消息，还会让每次 checkpoint 凭空多出几十 KB。
 		if message.Role == schema.System {
 			continue
 		}
+
+		// textParts：从各多媒体字段中提取文本，拼成一段纯文本。
 		textParts := make([]string, 0, 4)
+
+		// 从 Content 字段提取文本。
 		if text := strings.TrimSpace(message.Content); text != "" {
 			textParts = append(textParts, text)
 		}
+
+		// omittedParts：被丢弃的非文本多媒体片段数量（用于生成占位标记文本）。
 		omittedParts := 0
+
+		// 处理 MultiContent：历史 assistant 消息的多媒体内容（文本 + 图片 + 音频等）。
+		// 只保留文本部分，非文本（base64 图片等）计数后丢弃。
 		for _, part := range message.MultiContent {
 			if part.Type == schema.ChatMessagePartTypeText {
 				if text := strings.TrimSpace(part.Text); text != "" {
@@ -1202,6 +1290,9 @@ func retainModelMessages(messages []*schema.Message) []*schema.Message {
 				omittedParts++
 			}
 		}
+
+		// 处理 UserInputMultiContent：用户上传的附件（图片/文件等）。
+		// 只保留文本部分，非文本（base64 文件等）计数后丢弃。
 		for _, part := range message.UserInputMultiContent {
 			if part.Type == schema.ChatMessagePartTypeText {
 				if text := strings.TrimSpace(part.Text); text != "" {
@@ -1211,6 +1302,9 @@ func retainModelMessages(messages []*schema.Message) []*schema.Message {
 				omittedParts++
 			}
 		}
+
+		// 处理 AssistantGenMultiContent：模型生成的图文（图表/图片等）。
+		// 只保留文本，reasoning 放行但不保留（见下），其他非文本计数后丢弃。
 		for _, part := range message.AssistantGenMultiContent {
 			switch part.Type {
 			case schema.ChatMessagePartTypeText:
@@ -1219,18 +1313,24 @@ func retainModelMessages(messages []*schema.Message) []*schema.Message {
 				}
 			case schema.ChatMessagePartTypeReasoning:
 				// Reasoning 只作为脱敏调试事件展示，不进入跨轮 checkpoint。
+				// 理由：模型在下一轮会重新推理，旧的 reasoning 不仅无意义，还可能污染新推理。
 			default:
 				omittedParts++
 			}
 		}
+
+		// 有被丢弃的非文本片段 → 追加占位标记，让未来读 checkpoint 的人知道"这轮有附件，但二进制已丢"。
 		if omittedParts > 0 {
 			textParts = append(textParts, fmt.Sprintf("[%d multimodal attachment(s) were used for this turn; binary content is not retained.]", omittedParts))
 		}
+
+		// 把提取的文本拼回 Content，同时清空所有多媒体字段和 reasoning。
+		// 如果不清空，下次 marshal 时这些字段还会被序列化进 BLOB，等于白脱敏了。
 		message.Content = redactModelText(strings.Join(textParts, "\n\n"))
-		message.ReasoningContent = ""
-		message.MultiContent = nil
-		message.UserInputMultiContent = nil
-		message.AssistantGenMultiContent = nil
+		message.ReasoningContent = ""          // 清空思维链
+		message.MultiContent = nil             // 清空历史多媒体
+		message.UserInputMultiContent = nil    // 清空用户多媒体
+		message.AssistantGenMultiContent = nil // 清空模型多媒体
 		retained = append(retained, message)
 	}
 	return retained
@@ -1728,7 +1828,7 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 	}
 
 	// 10) 启动 Eino Runner，订阅事件流。
-	einoRunner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: chatAgent})
+	einoRunner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: chatAgent, EnableStreaming: true})
 	events := einoRunner.Run(ctx, messages)
 	// 11) 事件循环：每个事件可能是 assistant 消息、tool result、错误。
 	for {
@@ -1741,7 +1841,24 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 			slog.Error("diagnostic agent event failed", "run_id", runID, "conversation_id", run.ConversationID, "error", explainedErr)
 			return e.fail(runID, fmt.Errorf("Eino agent run: %w", explainedErr))
 		}
-		message, _, messageErr := adk.GetMessage(event)
+		var streamMessageID string
+		streamMessageStarted := false
+		if event.Output != nil && event.Output.MessageOutput != nil &&
+			event.Output.MessageOutput.IsStreaming && event.Output.MessageOutput.Role == schema.Assistant {
+			streamMessageID = uuid.NewString()
+		}
+		message, messageErr := consumeAgentEventMessage(event, func(delta string) error {
+			if delta == "" {
+				return nil
+			}
+			if !streamMessageStarted {
+				if publishErr := e.runner.EmitAgentMessageStarted(runID, streamMessageID); publishErr != nil {
+					return publishErr
+				}
+				streamMessageStarted = true
+			}
+			return e.runner.EmitAgentMessageDelta(runID, streamMessageID, delta)
+		})
 		if messageErr != nil {
 			return e.fail(runID, fmt.Errorf("read Eino agent event: %w", messageErr))
 		}
@@ -1759,7 +1876,12 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 			}
 			// 剥离 <think>...</think> 块，只把对外可见内容推给前端。
 			if content := visibleAssistantContent(message.Content); content != "" {
-				if err = e.runner.PublishAgentMessage(runID, content); err != nil {
+				if streamMessageStarted {
+					err = e.runner.PublishAgentMessageWithID(runID, streamMessageID, content)
+				} else {
+					err = e.runner.PublishAgentMessage(runID, content)
+				}
+				if err != nil {
 					return e.fail(runID, err)
 				}
 			}
@@ -1783,6 +1905,52 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 	}
 	_, err = e.runner.Complete(runID, contextJSON)
 	return err
+}
+
+// consumeAgentEventMessage 保留 Eino 对完整消息（尤其是流式 ToolCall 参数）的
+// 拼接语义，同时把 assistant 的可见正文增量交给 UI。工具仍由 Eino 在完整消息
+// 形成后路由到 ToolsNode；这里不解析参数，也不会提前执行工具。
+func consumeAgentEventMessage(event *adk.AgentEvent, onVisibleDelta func(string) error) (*schema.Message, error) {
+	if event == nil || event.Output == nil || event.Output.MessageOutput == nil {
+		return nil, nil
+	}
+	output := event.Output.MessageOutput
+	if !output.IsStreaming {
+		return output.Message, nil
+	}
+	if output.MessageStream == nil {
+		return nil, errors.New("Eino returned a streaming message without a stream reader")
+	}
+
+	stream := output.MessageStream
+	defer stream.Close()
+	chunks := make([]*schema.Message, 0, 16)
+	filter := thinkStreamFilter{}
+	for {
+		chunk, receiveErr := stream.Recv()
+		if errors.Is(receiveErr, io.EOF) {
+			break
+		}
+		if receiveErr != nil {
+			return nil, receiveErr
+		}
+		chunks = append(chunks, chunk)
+		if output.Role == schema.Assistant && chunk != nil && onVisibleDelta != nil {
+			if delta := filter.Write(chunk.Content, false); delta != "" {
+				if callbackErr := onVisibleDelta(delta); callbackErr != nil {
+					return nil, callbackErr
+				}
+			}
+		}
+	}
+	if output.Role == schema.Assistant && onVisibleDelta != nil {
+		if delta := filter.Write("", true); delta != "" {
+			if callbackErr := onVisibleDelta(delta); callbackErr != nil {
+				return nil, callbackErr
+			}
+		}
+	}
+	return schema.ConcatMessages(chunks)
 }
 
 // modelErrorIsRetryable 限制重试只针对瞬时故障。provider 侧的 4xx 错误
@@ -2527,30 +2695,48 @@ func contextSummaryTriggerTokens(settings domain.ModelSettings) int {
 //     assistant 的 tool call 必须和对应 tool result 留在同一 block（防止半截进入摘要）。
 //  2. 选 block：必选最近一条 user（当前 goal），从尾向前补最近 N 条 block，超 summaryInputMaxBytes 停止。
 //  3. 中间丢弃部分插入占位 user 消息，让摘要模型知道"中间有省略，需要时用 evidence ID 反查"。
+//
+// projectMessagesForSummary 把完整对话历史"投影"成摘要模型输入。
+// 输入：原始 state.Messages。
+// 输出：只包含"最近用户目标 + 最近 N 条完整 block"的消息数组，中间丢弃部分用占位消息标记。
 func projectMessagesForSummary(original []*schema.Message) []*schema.Message {
+	// 第一步：先通用脱敏（丢 system/丢二进制/丢 reasoning/脱敏文本），后续操作不接触敏感数据。
 	original = retainModelMessages(original)
+
+	// blocks：消息块数组，每个 block 是"user 单独"或"assistant+toolcalls+对应的 tool results"。
 	blocks := make([][]*schema.Message, 0)
+
+	// 第二步：遍历原始消息，按规则拆 block。
 	for index := 0; index < len(original); {
-		message := original[index]
+		message := original[index] // 当前消息
+
 		// system 消息：跳过（已经被 systemInstruction 单独注入）。
 		if message == nil || message.Role == schema.System {
 			index++
 			continue
 		}
-		block := []*schema.Message{compactSummaryMessage(message)}
+
+		// 新 block 从当前消息开始（先 compact 压缩一波）。
+		block := []*schema.Message{compactSummaryMessage(message)} // compactSummaryMessage 负责脱敏和压缩单条消息，保证 block 内不包含敏感/二进制数据
 		index++
+
 		// assistant 带 tool call：把同 block 内的所有 tool result 一起带上。
+		// 目的是防止"assistant 的工具调用"和"对应的工具结果"被拆到不同 block，
+		// 导致摘要模型看到孤立 tool call 或孤立 tool result，产生困惑或编造。
 		if message.Role == schema.Assistant && len(message.ToolCalls) > 0 {
+			// 收集本次 assistant 消息里所有 tool call 的 ID。
 			callIDs := make(map[string]struct{}, len(message.ToolCalls))
 			for _, call := range message.ToolCalls {
 				callIDs[call.ID] = struct{}{}
 			}
+			// 从下一条消息开始，连续收 tool result。
 			for index < len(original) {
 				toolMessage := original[index]
+				// 不是 tool 消息 → 说明这个 assistant 的 tool calls 已经全部收完了。
 				if toolMessage == nil || toolMessage.Role != schema.Tool {
 					break
 				}
-				// 只收属于本次 call 的 result；其他 tool result 留给后续 block。
+				// 只收属于本次 call 的 result；属于其他 assistant 的 tool result 留给后续 block。
 				if _, ok := callIDs[toolMessage.ToolCallID]; !ok {
 					break
 				}
@@ -2558,29 +2744,40 @@ func projectMessagesForSummary(original []*schema.Message) []*schema.Message {
 				index++
 			}
 		}
+		// block 收工：要么是"user"单独，要么是"assistant+toolcalls+对应 tool results"完整块。
 		blocks = append(blocks, block)
 	}
 
+	// 没有任何可投影的消息（全部是 system 或 nil），返回占位消息让摘要模型知道"无内容"。
 	if len(blocks) == 0 {
 		return []*schema.Message{schema.UserMessage("The conversation has not yet produced any messages that can be summarized.")}
 	}
-	// 选 block：锚定最近一条 user，也就是当前 run 的目标。旧 run 的第一条 user
-	// 不再享有特殊优先级，避免摘要把已完成目标重新提升为当前任务。
-	selected := make([]bool, len(blocks))
-	selectedBytes := 0
-	selectedCount := 0
-	latestUser := -1
+
+	// 第三步：选 block。
+	// 选 block 规则：锚定最近一条 user（当前 goal），从尾向前补最近 N 条，超预算就停。
+	//
+	// 为什么锚定最近一条 user？因为一条 user 消息代表一个"用户目标"（用户直接或间接提出的诊断请求）。
+	// 旧 run 的 user 消息不再享有特殊优先级，避免摘要把"已完成目标"重新提升为当前任务。
+	selected := make([]bool, len(blocks)) // 标记哪些 block 被选中
+	selectedBytes := 0                    // 已选 block 的总字节数
+	selectedCount := 0                    // 已选 block 的数量
+	latestUser := -1                      // 最近一条 user 消息的 block 索引
+
+	// 从尾往前找最近一条 user 消息。
 	for index := len(blocks) - 1; index >= 0; index-- {
 		if blocks[index][0].Role == schema.User {
 			latestUser = index
 			break
 		}
 	}
+	// 最近一条 user 必选（锚定当前 goal）。
 	if latestUser >= 0 {
 		selected[latestUser] = true
 		selectedBytes += messageBlockBytes(blocks[latestUser])
 		selectedCount++
 	}
+
+	// 从尾向前补最近 N 条 block，超 summaryInputMaxBytes 就跳过（不切碎 block，整块跳过）。
 	start := len(blocks) - 1
 	for start >= 0 && selectedCount < summaryRecentMessageCount {
 		if selected[start] {
@@ -2600,10 +2797,13 @@ func projectMessagesForSummary(original []*schema.Message) []*schema.Message {
 		start--
 	}
 
+	// 第四步：构造输出。中间丢弃的 block 插入一条占位 user 消息。
 	result := make([]*schema.Message, 0)
+	// 有 block 被丢弃了 → 插入占位，让摘要模型知道"有省略，需要时用 evidence ID 反查"。
 	if selectedCount < len(blocks) {
 		result = append(result, schema.UserMessage("[Earlier diagnostic messages were compacted; consult evidence IDs when details are required.]"))
 	}
+	// 按原始顺序把选中的 block 依次追加到结果中。
 	for index, block := range blocks {
 		if selected[index] {
 			result = append(result, block...)
@@ -2838,6 +3038,103 @@ func visibleAssistantContent(content string) string {
 	content = unclosedThinkBlock.ReplaceAllString(content, "")
 	content = strings.ReplaceAll(content, "</think>", "")
 	return strings.TrimSpace(content)
+}
+
+// thinkStreamFilter 在 chunk 边界上识别 <think> 标签，只把外部正文增量交给
+// 前端。pending 会保留可能被拆开的标签前缀，避免先把 "<thi" 显示出来，随后
+// 又无法从已经渲染的文本中撤回。
+type thinkStreamFilter struct {
+	pending     string
+	insideThink bool
+}
+
+func (f *thinkStreamFilter) Write(chunk string, final bool) string {
+	f.pending += chunk
+	var visible strings.Builder
+	for f.pending != "" {
+		lower := strings.ToLower(f.pending)
+		if f.insideThink {
+			if end := strings.Index(lower, "</think>"); end >= 0 {
+				f.pending = f.pending[end+len("</think>"):]
+				f.insideThink = false
+				continue
+			}
+			if final {
+				f.pending = ""
+				break
+			}
+			f.pending = trailingTagPrefix(f.pending, "</think>")
+			break
+		}
+
+		open := strings.Index(lower, "<think")
+		closeTag := strings.Index(lower, "</think>")
+		next := open
+		if next < 0 || closeTag >= 0 && closeTag < next {
+			next = closeTag
+		}
+		if next < 0 {
+			if final {
+				visible.WriteString(f.pending)
+				f.pending = ""
+				break
+			}
+			tail := longestTagPrefixSuffix(f.pending, "<think", "</think>")
+			visible.WriteString(f.pending[:len(f.pending)-len(tail)])
+			f.pending = tail
+			break
+		}
+		if next > 0 {
+			visible.WriteString(f.pending[:next])
+			f.pending = f.pending[next:]
+			continue
+		}
+		if strings.HasPrefix(lower, "</think>") {
+			f.pending = f.pending[len("</think>"):]
+			continue
+		}
+		if len(f.pending) == len("<think") && !final {
+			break
+		}
+		if len(f.pending) > len("<think") {
+			boundary := f.pending[len("<think")]
+			if boundary != '>' && boundary != ' ' && boundary != '\t' && boundary != '\r' && boundary != '\n' {
+				visible.WriteByte(f.pending[0])
+				f.pending = f.pending[1:]
+				continue
+			}
+		}
+		if tagEnd := strings.IndexByte(f.pending, '>'); tagEnd >= 0 {
+			f.pending = f.pending[tagEnd+1:]
+			f.insideThink = true
+			continue
+		}
+		if final {
+			f.pending = ""
+		}
+		break
+	}
+	return visible.String()
+}
+
+func trailingTagPrefix(value, tag string) string {
+	lower := strings.ToLower(value)
+	for length := min(len(lower), len(tag)-1); length > 0; length-- {
+		if strings.HasSuffix(lower, tag[:length]) {
+			return value[len(value)-length:]
+		}
+	}
+	return ""
+}
+
+func longestTagPrefixSuffix(value string, tags ...string) string {
+	longest := ""
+	for _, tag := range tags {
+		if candidate := trailingTagPrefix(value, tag); len(candidate) > len(longest) {
+			longest = candidate
+		}
+	}
+	return longest
 }
 
 // fileWriteArguments 是 write_file 工具的入参。所有 write 都强制走 user approval。
