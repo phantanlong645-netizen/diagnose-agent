@@ -855,6 +855,9 @@ func (w *engineTeamWorker) Work(ctx context.Context, input TeamWorkInput) (TeamS
 // RunTeam 是显式的深度诊断入口。worker 历史刻意不保留：只有最终审阅后的
 // 答案加入父对话，而工具证据持续持久化在父 run 之下。
 func (e *Engine) RunTeam(ctx context.Context, runID string) error {
+	// Team 下多个 worker 会共享同一个 run 级取消标记；必须等整个 Team 退出后再清理，
+	// 不能让先结束的 worker 把其他 worker 的安全停止状态提前删除。
+	defer e.clearCancellation(runID)
 	run, exists := e.runner.Run(runID)
 	if !exists {
 		return fmt.Errorf("diagnostic run not found: %s", runID)
@@ -940,6 +943,11 @@ func (e *Engine) RunTeam(ctx context.Context, runID string) error {
 
 	teamResult, err := team.Run(ctx, run.Goal)
 	if err != nil {
+		if e.cancellationRequested(runID) {
+			// 用户停止时 worker 会以 Eino CancelError 结束，Team 调度层可能把它包装成普通错误；
+			// 此处按 run 级取消标记识别并吞掉，避免错误发布 run.failed。
+			return nil
+		}
 		return e.fail(runID, err)
 	}
 	if teamResult.Answer == "" {
@@ -1083,8 +1091,13 @@ Your final response is a concise evidence report for the supervisor, not JSON. S
 		return TeamStepResult{}, fmt.Errorf("create team worker %s: %w", input.Step.ID, err)
 	}
 
+	// 每个 worker 都登记独立的 Eino 取消入口。App 停止 Team 时会先同时通知所有
+	// worker 在当前工具批次结束后收尾，再取消外层 Team context。
+	cancelOption, cancelFn := adk.WithCancel()
+	unregisterCancel := e.registerCancelFunc(run.ID, cancelFn)
+	defer unregisterCancel()
 	workerRunner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: workerAgent})
-	events := workerRunner.Run(ctx, []*schema.Message{schema.UserMessage(workerPrompt)})
+	events := workerRunner.Run(ctx, []*schema.Message{schema.UserMessage(workerPrompt)}, cancelOption)
 	finalContent := ""
 	evidenceItems := make([]domain.Evidence, 0)
 	evidenceDigests := make([]string, 0)
@@ -1096,6 +1109,10 @@ Your final response is a concise evidence report for the supervisor, not JSON. S
 			break
 		}
 		if event.Err != nil {
+			var cancelErr *adk.CancelError
+			if errors.As(event.Err, &cancelErr) && e.cancellationRequested(run.ID) {
+				return TeamStepResult{}, context.Canceled
+			}
 			explainedErr := explainModelProviderError(event.Err)
 			if isTeamWorkerIterationLimit(explainedErr) {
 				iterationLimitErr = explainedErr

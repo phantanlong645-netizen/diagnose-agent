@@ -100,6 +100,9 @@ const (
 	multimodalPartEstimateBytes = 4 * 1024
 	// 单条调试推理事件按 rune 限长，避免中文被截成无效 UTF-8。
 	reasoningDisplayMaxRunes = 4000
+	// gracefulCancelTimeout 是用户点击“停止”后等待当前并行工具批次收尾的最长时间。
+	// 超时后 Eino 会自动升级为立即取消，避免 NETCONF/HTTP 卡住时界面永久等待。
+	gracefulCancelTimeout = 20 * time.Second
 )
 
 const systemInstruction = `You are an evidence-driven OLT diagnostic agent.
@@ -216,6 +219,12 @@ type Engine struct {
 	manualDraftModel model.ToolCallingChatModel  // Manual Builder 专用，强制 JSON object 输出
 	settings         domain.ModelSettingsSummary // 脱敏后的模型设置（不含 APIKey），用于前端展示
 	config           domain.ModelSettings        // 完整模型设置（含 APIKey），仅供本包内构造 ChatModel 用
+
+	// cancelMu 保护每个 run 当前存活的 Eino Runner 取消函数。普通模式通常只有一个，
+	// Team 模式可能同时存在多个 worker；停止时要先通知全部 worker 在工具批次后收尾。
+	cancelMu        sync.Mutex
+	cancelFuncs     map[string]map[string]adk.AgentCancelFunc
+	cancelRequested map[string]bool
 }
 
 // TargetResolver 抽象出 target profile 的查询能力，便于测试时注入 mock。
@@ -1372,7 +1381,88 @@ func NewEngine(runner *application.Runner, targets TargetResolver) (*Engine, err
 	if targets == nil {
 		return nil, errors.New("target resolver is required")
 	}
-	return &Engine{runner: runner, targets: targets}, nil
+	return &Engine{
+		runner:          runner,
+		targets:         targets,
+		cancelFuncs:     make(map[string]map[string]adk.AgentCancelFunc),
+		cancelRequested: make(map[string]bool),
+	}, nil
+}
+
+// registerCancelFunc 登记一个属于 run 的 Eino 取消入口，并返回对称的注销函数。
+// Team worker 会并发登记，因此不能用单个 map[runID]func 覆盖前一个 worker。
+func (e *Engine) registerCancelFunc(runID string, cancelFn adk.AgentCancelFunc) func() {
+	registrationID := uuid.NewString()
+	e.cancelMu.Lock()
+	if e.cancelFuncs[runID] == nil {
+		e.cancelFuncs[runID] = make(map[string]adk.AgentCancelFunc)
+	}
+	e.cancelFuncs[runID][registrationID] = cancelFn
+	e.cancelMu.Unlock()
+
+	return func() {
+		e.cancelMu.Lock()
+		delete(e.cancelFuncs[runID], registrationID)
+		if len(e.cancelFuncs[runID]) == 0 {
+			delete(e.cancelFuncs, runID)
+		}
+		e.cancelMu.Unlock()
+	}
+}
+
+// RequestCancel 请求当前 run 在“本批工具全部完成”这个安全点停止。
+// 返回 false 表示当前正处于 Planner/Reviewer 等非 Eino Runner 阶段，调用方应使用
+// 外层 context 取消作为兜底；超时由 Eino 升级成 CancelImmediate，已完成工具证据仍保留。
+func (e *Engine) RequestCancel(runID string) (bool, error) {
+	e.cancelMu.Lock()
+	e.cancelRequested[runID] = true
+	registered := e.cancelFuncs[runID]
+	cancelFuncs := make([]adk.AgentCancelFunc, 0, len(registered))
+	for _, cancelFn := range registered {
+		cancelFuncs = append(cancelFuncs, cancelFn)
+	}
+	e.cancelMu.Unlock()
+	if len(cancelFuncs) == 0 {
+		return false, nil
+	}
+
+	// 先向所有并行 worker 发出请求，再等待各自结束；如果边发边等，会把并行停止退化成串行。
+	handles := make([]*adk.CancelHandle, 0, len(cancelFuncs))
+	for _, cancelFn := range cancelFuncs {
+		handle, accepted := cancelFn(
+			adk.WithAgentCancelMode(adk.CancelAfterToolCalls),
+			adk.WithAgentCancelTimeout(gracefulCancelTimeout),
+			adk.WithRecursive(),
+		)
+		if accepted && handle != nil {
+			handles = append(handles, handle)
+		}
+	}
+
+	var waitErrors []error
+	for _, handle := range handles {
+		if err := handle.Wait(); err != nil && !errors.Is(err, adk.ErrCancelTimeout) && !errors.Is(err, adk.ErrExecutionEnded) {
+			waitErrors = append(waitErrors, err)
+		}
+	}
+	return true, errors.Join(waitErrors...)
+}
+
+// cancellationRequested 用于把安全停止产生的 CancelError 与真正运行故障区分开，
+// 防止用户主动停止 Team worker 时被错误记录为 run.failed。
+func (e *Engine) cancellationRequested(runID string) bool {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	return e.cancelRequested[runID]
+}
+
+// clearCancellation 清理 run 级取消标记；只在整个普通/Team run 退出时调用，
+// 不能由单个 Team worker 清理，否则其他并行 worker 会失去“用户主动停止”语义。
+func (e *Engine) clearCancellation(runID string) {
+	e.cancelMu.Lock()
+	delete(e.cancelRequested, runID)
+	delete(e.cancelFuncs, runID)
+	e.cancelMu.Unlock()
 }
 
 // Configure 在前端"保存设置"入口调用：会替换 ChatModel 客户端，并对 provider 做一次连接验证。
@@ -1691,6 +1781,9 @@ func manualDraftToolCall(profileID string, draft domain.ManualDraft) (string, []
 //     - assistant 消息剥掉  thinking 块后推送给前端
 //  6. 正常结束后把 finalMessages 落库并 Complete
 func (e *Engine) Run(ctx context.Context, runID string) error {
+	// 整个 run 退出后统一清理取消登记；安全停止期间该标记必须一直保留，
+	// 这样事件循环才能把 Eino CancelError 识别成用户操作而不是模型故障。
+	defer e.clearCancellation(runID)
 	// 1) 解析 run 上下文：必须存在 run、必须指定了 profile。
 	run, exists := e.runner.Run(runID)
 	if !exists {
@@ -1827,9 +1920,13 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 		return e.fail(runID, fmt.Errorf("create Eino agent: %w", err))
 	}
 
-	// 10) 启动 Eino Runner，订阅事件流。
+	// 10) 启动 Eino Runner，订阅事件流。WithCancel 不会直接取消 Go context，
+	// 而是让 Eino 在当前并行工具批次完成后产生 CancelError，从而保住完整消息边界。
+	cancelOption, cancelFn := adk.WithCancel()
+	unregisterCancel := e.registerCancelFunc(runID, cancelFn)
+	defer unregisterCancel()
 	einoRunner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: chatAgent, EnableStreaming: true})
-	events := einoRunner.Run(ctx, messages)
+	events := einoRunner.Run(ctx, messages, cancelOption)
 	// 11) 事件循环：每个事件可能是 assistant 消息、tool result、错误。
 	for {
 		event, ok := events.Next()
@@ -1837,6 +1934,12 @@ func (e *Engine) Run(ctx context.Context, runID string) error {
 			break
 		}
 		if event.Err != nil {
+			var cancelErr *adk.CancelError
+			if errors.As(event.Err, &cancelErr) && e.cancellationRequested(runID) {
+				// 用户主动安全停止不是 run.failed。此时当前工具批次已经完整收尾，
+				// conversationRecorder 也已收到对应 ToolResult；终态由 App.CancelDiagnostic 统一落库。
+				return nil
+			}
 			explainedErr := explainModelProviderError(event.Err)
 			slog.Error("diagnostic agent event failed", "run_id", runID, "conversation_id", run.ConversationID, "error", explainedErr)
 			return e.fail(runID, fmt.Errorf("Eino agent run: %w", explainedErr))

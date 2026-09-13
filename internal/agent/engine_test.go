@@ -168,6 +168,99 @@ func TestConsumeAgentEventMessageKeepsEinoToolCallConcatenation(t *testing.T) {
 	}
 }
 
+func TestConversationRecorderWaitsForEveryParallelToolResult(t *testing.T) {
+	// 模拟模型一次返回三个并行工具调用：前两个完成时不能形成可回放历史，
+	// 第三个结果到达后才把完整 assistant/tool 批次写入 checkpoint。
+	var checkpoints [][]*schema.Message
+	recorder := &conversationRecorder{
+		BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
+		checkpoint: func(messages []*schema.Message) error {
+			cloned, err := cloneMessages(messages)
+			if err != nil {
+				return err
+			}
+			checkpoints = append(checkpoints, cloned)
+			return nil
+		},
+	}
+	toolCalls := []schema.ToolCall{
+		{ID: "call-a", Function: schema.FunctionCall{Name: "tool_a", Arguments: `{}`}},
+		{ID: "call-b", Function: schema.FunctionCall{Name: "tool_b", Arguments: `{}`}},
+		{ID: "call-c", Function: schema.FunctionCall{Name: "tool_c", Arguments: `{}`}},
+	}
+	if err := recorder.captureModelState([]*schema.Message{
+		schema.UserMessage("diagnose"),
+		schema.AssistantMessage("", toolCalls),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 0 {
+		t.Fatalf("pending tool calls were checkpointed before results: %d", len(checkpoints))
+	}
+
+	for _, result := range []*schema.Message{
+		{Role: schema.Tool, ToolCallID: "call-a", Content: "result-a"},
+		{Role: schema.Tool, ToolCallID: "call-b", Content: "result-b"},
+	} {
+		if err := recorder.ObserveToolResult(result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(checkpoints) != 0 {
+		t.Fatalf("partial parallel results were checkpointed: %d", len(checkpoints))
+	}
+
+	if err := recorder.ObserveToolResult(&schema.Message{Role: schema.Tool, ToolCallID: "call-c", Content: "result-c"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 1 {
+		t.Fatalf("complete tool batch checkpoints = %d, want 1", len(checkpoints))
+	}
+	got := checkpoints[0]
+	if len(got) != 5 {
+		t.Fatalf("checkpoint messages = %d, want user + assistant + 3 tool results", len(got))
+	}
+	for index, callID := range []string{"call-a", "call-b", "call-c"} {
+		if got[index+2].ToolCallID != callID {
+			t.Fatalf("tool result %d call id = %q, want %q", index, got[index+2].ToolCallID, callID)
+		}
+	}
+}
+
+func TestEngineRequestCancelNotifiesEveryActiveRunner(t *testing.T) {
+	engine := &Engine{
+		cancelFuncs:     make(map[string]map[string]adk.AgentCancelFunc),
+		cancelRequested: make(map[string]bool),
+	}
+	called := make([]string, 0, 2)
+	register := func(name string) func() {
+		return engine.registerCancelFunc("run-1", func(...adk.AgentCancelOption) (*adk.CancelHandle, bool) {
+			called = append(called, name)
+			return nil, false
+		})
+	}
+	unregisterA := register("worker-a")
+	unregisterB := register("worker-b")
+
+	found, err := engine.RequestCancel("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || len(called) != 2 {
+		t.Fatalf("safe cancel found=%v calls=%v, want both active workers", found, called)
+	}
+	if !engine.cancellationRequested("run-1") {
+		t.Fatal("run-level cancellation marker was not retained")
+	}
+
+	unregisterA()
+	unregisterB()
+	engine.clearCancellation("run-1")
+	if engine.cancellationRequested("run-1") {
+		t.Fatal("run-level cancellation marker was not cleared")
+	}
+}
+
 func TestRetainModelMessagesDropsReasoningWithoutAttachmentMarker(t *testing.T) {
 	retained := retainModelMessages([]*schema.Message{{
 		Role:             schema.Assistant,

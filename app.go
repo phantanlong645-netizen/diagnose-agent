@@ -602,13 +602,27 @@ func (a *App) ExecuteManualTool(runID, toolName, arguments string) (domain.Evide
 }
 
 func (a *App) CancelDiagnostic(runID string) (domain.Run, error) {
+	// 优先请求 Eino 在当前并行工具批次全部结束后安全停止。这样 assistant 的
+	// ToolCall 与所有 ToolResult 能形成完整边界，由 conversationRecorder 写入
+	// conversation_contexts；已经完成的工具业务结果仍按原设计保存在 evidence 中。
+	_, gracefulErr := a.engine.RequestCancel(runID)
+
 	a.cancelMu.Lock()
 	cancel := a.cancels[runID]
 	a.cancelMu.Unlock()
+	// 普通 Agent 在安全点返回后仍取消外层 context 做资源清理；Team 的 Planner、
+	// Reviewer 不是 Eino Runner，或停止请求到达时尚无 worker，则只能依靠这条兜底。
+	// 没有登记中的 Eino Runner 不代表失败，只表示当前阶段没有可等待的工具批次。
 	if cancel != nil {
 		cancel()
 	}
-	return a.runner.Cancel(runID)
+	cancelled, cancelErr := a.runner.Cancel(runID)
+	if gracefulErr != nil {
+		// 即使安全停止本身报错，也必须继续执行外层取消并落下 cancelled 终态；
+		// 否则一次停止失败会把后台任务永久留在 running。
+		return cancelled, errors.Join(fmt.Errorf("stop diagnostic at tool-call boundary: %w", gracefulErr), cancelErr)
+	}
+	return cancelled, cancelErr
 }
 
 func (a *App) DiagnosticRun(runID string) (domain.Run, error) {
